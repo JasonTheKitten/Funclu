@@ -1,9 +1,31 @@
-local function eval(ctx, func)
-  if type(func) == "function" then
-    return func()(ctx)
-  else
-    return func
+local ARGS_SYMBOL = {}
+local ARG_SYMBOL = {}
+
+--
+
+local function cloneTable(tbl)
+  local newTbl = {}
+  for k, v in pairs(tbl) do
+    newTbl[k] = v
   end
+  return newTbl
+end
+
+--
+
+local function eval(ctx, func, ...)
+  local res = func
+  if type(func) == "function" then
+    local args = { ... }
+    if #args > 0 then
+      res = res(...)
+    end
+    res = res()(ctx)
+  end
+  if (type(res) == "table") and (res[ARG_SYMBOL] == true) then
+    return ctx.args[res.name]
+  end
+  return res
 end
 
 local function funcify(func)
@@ -63,6 +85,9 @@ end)
 
 local f = funcify(function(ctx, name, ...)
   local args = { ... }
+  if not ctx.functions[name] then
+    error("f: No function named " .. name)
+  end
   if #args == 0 then
     return ctx.functions[name]()(ctx)
   else
@@ -70,13 +95,61 @@ local f = funcify(function(ctx, name, ...)
   end
 end)
 
-local defn = funcify(function(ctx, name, func)
-  ctx.functions[name] = func
+local defn = funcify(function(ctx, ...)
+  local args  = { ... }
+  
+  local index = 1
+  local name, func, argList = "", nil, { [ARGS_SYMBOL] = true, args = {} }
+  if type(args[index] == "string") then
+    name = args[index]
+    index = index + 1
+  end
+  if args[index + 1] then
+    argList = eval(ctx, args[index])
+    index = index + 1
+  end
+  func = args[index]
+
+  if not func then
+    error("defn: No function provided")
+  end
+  if not argList[ARGS_SYMBOL] then
+    error("defn: Not a valid arg list")
+  end
+  argList = argList.args
+  
+  local wrappedFunc = funcify(function(ctx2, ...)
+    local innerArgs = { ... }
+    local namedArgs = {}
+    for i = 1, #argList do
+      namedArgs[argList[i]] = eval(ctx2, table.remove(innerArgs, 1))
+    end
+    local newCtx = cloneTable(ctx2)
+    newCtx.args = cloneTable(ctx2.args)
+    for k, v in pairs(namedArgs) do
+      newCtx.args[k] = v
+    end
+    return eval(newCtx, func, table.unpack(innerArgs))
+  end)
+  if name ~= "" then
+    ctx.functions[name] = wrappedFunc
+  end
+
+  return wrappedFunc
+end)
+
+local a = funcify(function(ctx, name)
+  return { [ARG_SYMBOL] = true, name = name }
+end)
+
+local argsF = funcify(function(ctx, ...)
+  return { [ARGS_SYMBOL] = true, args = { ... } }
 end)
 
 local function run(program)
   eval({
-    functions = {}
+    functions = {},
+    args = {}
   }, program)
 end
 
@@ -113,8 +186,8 @@ end)
 local sub = funcify(function(ctx, ...)
   local args = { ... }
   local diff = eval(ctx, args[1])
-  for k, v in ipairs(args) do
-    diff = diff - eval(ctx, v)
+  for i = 2, #args do
+    diff = diff - eval(ctx, args[i])
   end
   return diff
 end)
@@ -238,6 +311,8 @@ local environment = {
   unwrap = unwrap,
   f = f,
   defn = defn,
+  a = a,
+  args = argsF,
   run = run,
   luaf = luaf,
   luaftbl = luaftbl,
