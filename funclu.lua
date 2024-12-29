@@ -32,14 +32,13 @@ end
 
 local function luaf(func)
   return funcify(function(ctx, ...)
-    local args = { ... }
-    return func(table.unpack(args))
+    return func(...)
   end)
 end
 
 local function luaftbl(func)
-  return funcify(function(ctx, tbl)
-    return { func(table.unpack(tbl)) }
+  return funcify(function(ctx, ...)
+    return { func(...) }
   end)
 end
 
@@ -111,8 +110,69 @@ local add = funcify(function(ctx, ...)
   return sum
 end)
 
+local sub = funcify(function(ctx, ...)
+  local args = { ... }
+  local diff = eval(ctx, args[1])
+  for k, v in ipairs(args) do
+    diff = diff - eval(ctx, v)
+  end
+  return diff
+end)
+
+local mul = funcify(function(ctx, ...)
+  local args = { ... }
+  local product = 1
+  for k, v in ipairs(args) do
+    product = product * eval(ctx, v)
+  end
+  return product
+end)
+
+local div = funcify(function(ctx, ...)
+  local args = { ... }
+  local quotient = eval(ctx, args[1])
+  for i = 2, #args do
+    quotient = quotient / eval(ctx, args[i])
+  end
+  return quotient
+end)
+
 local inc = add (1)
 local dec = add (-1)
+local neg = mul (-1)
+
+--
+
+local eq = funcify(function(ctx, ...)
+  local args = { ... }
+  local value = eval(ctx, args[1])
+  for k, v in ipairs(args) do
+    if value ~= eval(ctx, v) then
+      return false
+    end
+  end
+  return true
+end)
+
+local lt = funcify(function(ctx, a, b)
+  return eval(ctx, a) < eval(ctx, b)
+end)
+
+local gt = funcify(function(ctx, a, b)
+  return eval(ctx, a) > eval(ctx, b)
+end)
+
+local lte = funcify(function(ctx, a, b)
+  return eval(ctx, a) <= eval(ctx, b)
+end)
+
+local gte = funcify(function(ctx, a, b)
+  return eval(ctx, a) >= eval(ctx, b)
+end)
+
+local neq = funcify(function(ctx, a, b)
+  return eval(ctx, a) ~= eval(ctx, b)
+end)
 
 --
 
@@ -182,8 +242,18 @@ local environment = {
   luaf = luaf,
   luaftbl = luaftbl,
   add = add,
+  sub = sub,
+  mul = mul,
+  div = div,
   inc = inc,
   dec = dec,
+  neg = neg,
+  eq = eq,
+  lt = lt,
+  gt = gt,
+  lte = lte,
+  gte = gte,
+  neq = neq,
   check = check,
   prints = prints,
   map = map,
