@@ -6,10 +6,14 @@ local SEQ_DONE_SYMBOL = {}
 
 --
 
-local function cloneTable(tbl)
+local function cloneTable(tbl, recursive)
   local newTbl = {}
   for k, v in pairs(tbl) do
-    newTbl[k] = v
+    if recursive and type(v) == "table" then
+      newTbl[k] = cloneTable(v, true)
+    else
+      newTbl[k] = v
+    end
   end
   return newTbl
 end
@@ -199,14 +203,16 @@ local defn = funcify(function(ctx, ...)
   end
   argList = argList.args
   
+  local scopeCtx = cloneTable(ctx, true)
   local wrappedFunc = funcify(function(ctx2, ...)
     local innerArgs = { ... }
     local namedArgs = {}
     for i = 1, #argList do
       namedArgs[argList[i]] = eval(ctx2, table.remove(innerArgs, 1))
     end
-    local newCtx = cloneTable(ctx2)
-    newCtx.args = cloneTable(ctx2.args)
+    -- TODO: What should be inherited from ctx, and what should be inherited from ctx2?
+    local newCtx = cloneTable(scopeCtx)
+    newCtx.args = cloneTable(scopeCtx.args)
     for k, v in pairs(namedArgs) do
       newCtx.args[k] = v
     end
@@ -214,6 +220,7 @@ local defn = funcify(function(ctx, ...)
   end)
   if name ~= "" then
     ctx.functions[name] = wrappedFunc
+    scopeCtx.functions[name] = wrappedFunc
   end
 
   return wrappedFunc -- TODO: This does not actually work as intended
@@ -352,12 +359,30 @@ end)
 
 --
 
-local check = funcify(function(ctx, value, func1, func2)
-  if eval(ctx, value) then
-    return eval(ctx, func1)
-  else
-    return eval(ctx, func2)
+local cond = funcify(function(ctx, ...)
+  local args = { ... }
+  for i = 1, #args, 2 do
+    local value = args[i]
+    local nextArg = args[i + 1]
+    if nextArg == nil then
+      return eval(ctx, value)
+    elseif eval(ctx, value) then
+      return eval(ctx, nextArg)
+    end
   end
+end)
+
+local with = funcify(function(ctx, ...)
+  local args = {...}
+
+  local newCtx = cloneTable(ctx)
+  newCtx.args = cloneTable(ctx.args)
+  for i = 1, #args, 2 do
+    newCtx.args[args[i]] = eval(newCtx, args[i + 1])
+  end
+
+  local func = args[#args]
+  return eval(newCtx, func)
 end)
 
 local prints = funcify(function(ctx, ...)
@@ -496,7 +521,8 @@ local environment = {
   gte = gte,
   neq = neq,
   seq = seq,
-  check = check,
+  cond = cond,
+  with = with,
   prints = prints,
   map = map,
   filter = filter,
