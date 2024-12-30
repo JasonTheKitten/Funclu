@@ -359,6 +359,68 @@ end)
 
 --
 
+local and_ = funcify(function(ctx, ...)
+  local args = { ... }
+  for k, v in ipairs(args) do
+    if not eval(ctx, v) then
+      return false
+    end
+  end
+  return true
+end)
+
+local or_ = funcify(function(ctx, ...)
+  local args = { ... }
+  for k, v in ipairs(args) do
+    if eval(ctx, v) then
+      return true
+    end
+  end
+  return false
+end)
+
+local not_ = funcify(function(ctx, a)
+  return not eval(ctx, a)
+end)
+
+local xor = funcify(function(ctx, a, b)
+  return eval(ctx, a) ~= eval(ctx, b)
+end)
+
+--
+
+local function evalOp(code, ...)
+  local argArray = ""
+  for k, v in ipairs({ ... }) do
+    argArray = argArray .. ", " .. v
+  end
+  argArray = argArray:sub(3)
+  local func = load("return function(ctx, " .. argArray .. ") return " .. code .. " end")
+  return func()
+end
+
+local shl, shr, ashr, band, bor, bxor, bnot
+if bit32 then
+  shl = luaf(bit32.lshift)
+  shr = luaf(bit32.rshift)
+  ashr = luaf(bit32.arshift)
+  band = luaf(bit32.band)
+  bor = luaf(bit32.bor)
+  bxor = luaf(bit32.bxor)
+  bnot = luaf(bit32.bnot)
+else
+  shl = evalOp("a << b", "a", "b")
+  shr = evalOp("a >> b", "a", "b")
+  ashr = evalOp("a >> b", "a", "b")
+  band = evalOp("a & b", "a", "b")
+  bor = evalOp("a | b", "a", "b")
+  bxor = evalOp("a ~ b", "a", "b")
+  bnot = evalOp("~a", "a")
+end
+
+
+--
+
 local cond = funcify(function(ctx, ...)
   local args = { ... }
   for i = 1, #args, 2 do
@@ -521,6 +583,17 @@ local environment = {
   gte = gte,
   neq = neq,
   seq = seq,
+  and_ = and_,
+  or_ = or_,
+  not_ = not_,
+  xor = xor,
+  shl = shl,
+  shr = shr,
+  ashr = ashr,
+  band = band,
+  bor = bor,
+  bxor = bxor,
+  bnot = bnot,
   cond = cond,
   with = with,
   prints = prints,
