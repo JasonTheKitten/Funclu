@@ -69,17 +69,8 @@ end
 --
 
 local function tblSeq(tbl)
-  local index = 1
   return {
     [SEQ_SYMBOL] = true,
-    next = function()
-      if index > #tbl then
-        return SEQ_DONE_SYMBOL
-      end
-      local value = tbl[index]
-      index = index + 1
-      return value
-    end,
     at = function(i)
       if i > #tbl then
         return SEQ_DONE_SYMBOL
@@ -124,9 +115,10 @@ local function seqToTable(seq)
     return seq -- Already in normal table form
   end
 
-  local result, running = {}, true
+  local result, running, i = {}, true, 1
   while running do
-    local value = seq.next()
+    local value = seq.at(i)
+    i = i + 1
     if value == SEQ_DONE_SYMBOL then
       running = false
     else
@@ -252,9 +244,10 @@ local format
 format = function(ctx, rawValue)
   local value = eval(ctx, rawValue)
   if type(value) == "table" and value[SEQ_SYMBOL] then
-    local result, first, running = "(seq ", true, true
+    local result, first, running, i = "(seq ", true, true, 1
     while running do
-      local nextValue = value.next()
+      local nextValue = value.at(i)
+      i = i + 1
       if nextValue == SEQ_DONE_SYMBOL then
         running = false
       else
@@ -381,13 +374,8 @@ end)
 local map = funcify(function(ctx, func, args)
   local cache, index = {}, 1
   local myArgs = seqify(eval(ctx, args))
-  local mySeq
-  mySeq = {
+  return {
     [SEQ_SYMBOL] = true,
-    next = function()
-      index = index + 1
-      return mySeq.at(index - 1)
-    end,
     at = function(i)
       if not cache[i] then
         local value = eval(ctx, myArgs.at(i))
@@ -399,43 +387,44 @@ local map = funcify(function(ctx, func, args)
       return cache[i]
     end
   }
-  return mySeq
 end)
 
 local filter = funcify(function(ctx, func, args)
-  local cache, index = {}, 1
+  local cache, index, innerIndex = {}, 1, 1
   local myArgs = seqify(eval(ctx, args))
-  local mySeq
-  mySeq = {
-    [SEQ_SYMBOL] = true,
-    next = function()
-      while true do
-        local nextVal = myArgs.next()
-        if nextVal == SEQ_DONE_SYMBOL then
-          return SEQ_DONE_SYMBOL
-        end
-        if eval(ctx, func, nextVal) then
-          cache[index] = nextVal
-          index = index + 1
-          return nextVal
-        end
+
+  local function next()
+    while true do
+      local nextVal = myArgs.at(innerIndex)
+      innerIndex = innerIndex + 1
+      if nextVal == SEQ_DONE_SYMBOL then
+        return SEQ_DONE_SYMBOL
       end
-    end,
+      if eval(ctx, func, nextVal) then
+        cache[index] = nextVal
+        index = index + 1
+        return nextVal
+      end
+    end
+  end
+
+  return {
+    [SEQ_SYMBOL] = true,
     at = function(i)
       if cache[i] then
         return cache[i]
       end
 
       for j = index, i do
-        local nextVal = mySeq.next()
+        local nextVal = next()
         if nextVal == SEQ_DONE_SYMBOL then
           return SEQ_DONE_SYMBOL
         end
-        cache[j] = nextVal
       end
+
+      return cache[i]
     end
   }
-  return mySeq
 end)
 
 local foldl = funcify(function(ctx, func, acc, args)
@@ -471,7 +460,7 @@ local take = funcify(function(ctx, n, args)
     if i > maxN then
       return SEQ_DONE_SYMBOL
     end
-    return myArgs.next()
+    return myArgs.at(i)
   end)
 end)
 
