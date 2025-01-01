@@ -1,6 +1,9 @@
+local ANY_SYMBOL = {}
 local ARGS_SYMBOL = {}
 local ARG_SYMBOL = {}
+local CUSTOM_TYPE_SYMBOL = {}
 local EVAL_SYMBOL = {}
+local INSTATIATED_TYPE_SYMBOL = {}
 local SEQ_SYMBOL = {}
 local SEQ_DONE_SYMBOL = {}
 
@@ -40,7 +43,7 @@ local function eval(ctx, func, ...)
     end
     res = res(EVAL_SYMBOL)(ctx)
   end
-  if (type(res) == "table") and (res[ARG_SYMBOL] == true) then
+  if (type(res) == "table") and (res[ARG_SYMBOL] == true) and not ctx.disableArgumentResolution then
     return ctx.args[res.name]
   end
   return res
@@ -237,13 +240,138 @@ end)
 local function createCtx()
   return {
     functions = {},
-    args = {}
+    args = {},
+    types = {},
+    traits = {},
+    disableArgumentResolution = false
   }
 end
 
 local function run(program)
   eval(createCtx, program)
 end
+
+--
+
+local newtype = funcify(function(ctx, name, ...)
+  local args = { ... }
+  local eArgs = {}
+  local firstArg = #args > 0 and eval(ctx, args[1]) or nil
+  if firstArg and type(firstArg) == "table" and firstArg[ARGS_SYMBOL] then
+    eArgs = args[1].args
+  else
+    table.insert(eArgs, firstArg)
+    for i = 2, #args do
+      table.insert(eArgs, eval(ctx, args[i]))
+    end
+  end
+
+  local ntype = {
+    [CUSTOM_TYPE_SYMBOL] = true,
+    name = name,
+    args = eArgs
+  }
+  ctx.types[name] = ntype
+end)
+
+local eq2i
+eq2i = function(ctx, a, b, argBinder)
+  local aValue = eval(ctx, a)
+  local bValue = eval(ctx, b)
+
+  if aValue == ANY_SYMBOL or bValue == ANY_SYMBOL then
+    return true
+  end
+  if type(aValue) == "table" and aValue[ARG_SYMBOL] and argBinder then
+    argBinder[aValue.name] = bValue
+    return true
+  elseif type(bValue) == "table" and bValue[ARG_SYMBOL] and argBinder then
+    argBinder[bValue.name] = aValue
+    return true
+  end
+
+  if type(aValue) ~= type(bValue) then
+    return false
+  end
+  if type(aValue) == "table" and aValue[INSTATIATED_TYPE_SYMBOL] then
+    if aValue.type ~= bValue.type or aValue.name ~= bValue.name then
+      return false
+    end
+    for i = 1, #aValue.args do
+      if not eq2i(ctx, aValue.args[i], bValue.args[i], argBinder) then
+        return false
+      end
+    end
+    return true
+  end
+
+  return aValue == bValue
+end
+
+local eq2 = funcify(function(ctx, a, b)
+  return eq2i(ctx, a, b)
+end)
+
+local member = funcify(function(ctx, name, value)
+  local eValue = eval(ctx, value)
+  if not (type(eValue) == "table" and eValue[INSTATIATED_TYPE_SYMBOL]) then
+    error("member: Not an instatiated type")
+  end
+  local ntype = eValue.type
+
+  for i = 1, #ntype.args do
+    if ntype.args[i] == name then
+      return eValue.args[i]
+    end
+  end
+
+  error("member: No member named " .. name)
+end)
+
+local match = funcify(function(ctx, value, ...)
+  local args = { ... }
+  local firstArg = eval(ctx, value)
+  local noArgCtx = cloneTable(ctx)
+  noArgCtx.disableArgumentResolution = true
+  for i = 1, #args, 2 do
+    local compValue = args[i]
+    local nextArg = args[i + 1]
+    local boundArgs = {}
+    if nextArg == nil then
+      return eval(ctx, compValue)
+    elseif eq2i(noArgCtx, wrap(firstArg), compValue, boundArgs) then
+      local newCtx = cloneTable(ctx)
+      newCtx.args = cloneTable(ctx.args)
+      for k, v in pairs(boundArgs) do
+        newCtx.args[k] = v
+      end
+      return eval(newCtx, nextArg)
+    end
+  end
+end)
+
+local any = funcify(function(ctx, ...)
+  return ANY_SYMBOL
+end)
+
+local typeConstructor = function(ctx, name, ...)
+  local ntype = ctx.types[name]
+  if not ntype then
+    error("t: No type named " .. name)
+  end
+
+  local args = { ... }
+  if #args ~= #ntype.args then
+    error("t: Incorrect number of arguments")
+  end
+
+  return {
+    [INSTATIATED_TYPE_SYMBOL] = true,
+    type = ntype,
+    args = args
+  }
+end
+local t = keyFunc(funcify(typeConstructor))
 
 --
 
@@ -266,6 +394,14 @@ format = function(ctx, rawValue)
       end
     end
     return result .. ")"
+  elseif type(value) == "table" and value[INSTATIATED_TYPE_SYMBOL] then
+    local result = "(t." .. value.type.name
+    for k, v in ipairs(value.args) do
+      result = result .. " " .. format(ctx, v)
+    end
+    return result .. ")"
+  elseif value == ANY_SYMBOL then
+    return "any"
   else
     return tostring(value)
   end
@@ -396,6 +532,7 @@ local function evalOp(code, ...)
   end
   argArray = argArray:sub(3)
   local func = load("return function(ctx, " .. argArray .. ") return " .. code .. " end")
+  if not func then return end -- Hopefully, the program isn't using this
   return func()
 end
 
@@ -566,6 +703,13 @@ local environment = {
   a = a,
   args = argsF,
   run = run,
+  newtype = newtype,
+  eq2 = eq2,
+  member = member,
+  match = match,
+  any = any,
+  _ = any, -- Alias
+  t = t,
   luaf = luaf,
   luaftbl = luaftbl,
   add = add,
