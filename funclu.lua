@@ -3,7 +3,9 @@ local ARGS_SYMBOL = {}
 local ARG_SYMBOL = {}
 local CUSTOM_TYPE_SYMBOL = {}
 local EVAL_SYMBOL = {}
+local EXTENDS_SYMBOL = {}
 local INSTATIATED_TYPE_SYMBOL = {}
+local METHOD_DEFINITION_SYMBOL = {}
 local SEQ_SYMBOL = {}
 local SEQ_DONE_SYMBOL = {}
 
@@ -183,6 +185,23 @@ local f = keyFunc(funcify(function(ctx, name, ...)
   end
 end))
 
+local function wrapUserFunction(scopeCtx, argList, func)
+  return funcify(function(ctx2, ...)
+    local innerArgs = { ... }
+    local namedArgs = {}
+    for i = 1, #argList do
+      namedArgs[argList[i]] = eval(ctx2, table.remove(innerArgs, 1))
+    end
+    -- TODO: What should be inherited from ctx, and what should be inherited from ctx2?
+    local newCtx = cloneTable(scopeCtx)
+    newCtx.args = cloneTable(scopeCtx.args)
+    for k, v in pairs(namedArgs) do
+      newCtx.args[k] = v
+    end
+    return eval(newCtx, func, table.unpack(innerArgs))
+  end)
+end
+
 local defn = funcify(function(ctx, ...)
   local args  = { ... }
   
@@ -207,20 +226,7 @@ local defn = funcify(function(ctx, ...)
   argList = argList.args
   
   local scopeCtx = cloneTable(ctx, true)
-  local wrappedFunc = funcify(function(ctx2, ...)
-    local innerArgs = { ... }
-    local namedArgs = {}
-    for i = 1, #argList do
-      namedArgs[argList[i]] = eval(ctx2, table.remove(innerArgs, 1))
-    end
-    -- TODO: What should be inherited from ctx, and what should be inherited from ctx2?
-    local newCtx = cloneTable(scopeCtx)
-    newCtx.args = cloneTable(scopeCtx.args)
-    for k, v in pairs(namedArgs) do
-      newCtx.args[k] = v
-    end
-    return eval(newCtx, func, table.unpack(innerArgs))
-  end)
+  local wrappedFunc = wrapUserFunction(scopeCtx, argList, func)
   if name ~= "" then
     ctx.functions[name] = wrappedFunc
     scopeCtx.functions[name] = wrappedFunc
@@ -269,7 +275,8 @@ local newtype = funcify(function(ctx, name, ...)
   local ntype = {
     [CUSTOM_TYPE_SYMBOL] = true,
     name = name,
-    args = eArgs
+    args = eArgs,
+    instances = {}
   }
   ctx.types[name] = ntype
 end)
@@ -372,6 +379,169 @@ local typeConstructor = function(ctx, name, ...)
   }
 end
 local t = keyFunc(funcify(typeConstructor))
+
+--
+
+local deftrait = funcify(function(ctx, name, ...)
+  local args = { ... }
+  local traitName = eval(ctx, name)
+  local trait = {
+    name = traitName,
+    methods = {},
+    extends = {}
+  }
+  for i = 1, #args do
+    local arg = eval(ctx, args[i])
+    if type(arg) == "table" and arg[METHOD_DEFINITION_SYMBOL] then
+      arg.addToTraitOrInstance(trait)
+    elseif type(arg) == "table" and arg[EXTENDS_SYMBOL] then
+      table.insert(trait.extends, arg.name)
+    else
+      error("deftrait: Invalid argument")
+    end
+  end
+
+  ctx.traits[traitName] = trait
+end)
+
+local defmethod = funcify(function(ctx, name, ...)
+  local args = { ... }
+  local methodName = eval(ctx, name)
+  local argList = { [ARGS_SYMBOL] = true, args = {} }
+  local func = nil
+  if args[2] then
+    argList = eval(ctx, args[1])
+    func = args[2]
+  else
+    func = args[1]
+  end
+
+  if not argList[ARGS_SYMBOL] then
+    error("deftrait: Not a valid arg list")
+  end
+  argList = argList.args
+  table.insert(argList, 1, "self")
+
+  local wrappedFunc
+  if func then
+    local scopeCtx = cloneTable(ctx, true)
+    wrappedFunc = wrapUserFunction(scopeCtx, argList, func)
+  end
+
+  return {
+    [METHOD_DEFINITION_SYMBOL] = true,
+    addToTraitOrInstance = function(traitOrInstance, errOnNew)
+      if not traitOrInstance.methods[methodName] and errOnNew then
+        error("defmethod: Method " .. methodName .. " not valid for trait")
+      end
+      traitOrInstance.methods[methodName] = {
+        argList = argList,
+        wrappedFunc = wrappedFunc
+      }
+    end
+  }
+end)
+
+local instance = funcify(function(ctx, typeName, traitName, ...)
+  local args = {...}
+  local eTypeName = eval(ctx, typeName)
+  local eTraitName = eval(ctx, traitName)
+  local ntype = ctx.types[eTypeName]
+  local trait = ctx.traits[eTraitName]
+  
+  if not ntype then
+    error("instance: No type named " .. eTypeName)
+  end
+  if not trait then
+    error("instance: No trait named " .. eTraitName)
+  end
+  if ntype.instances[eTraitName] then
+    error("instance: Instance already exists")
+  end
+  for _, extendedTraitName in ipairs(trait.extends) do
+    if not ntype.instances[extendedTraitName] then
+      error("instance: Missing extended trait " .. extendedTraitName)
+    end
+  end
+
+  local instance = {
+    methods = cloneTable(trait.methods),
+  }
+
+  for i = 1, #args do
+    local arg = eval(ctx, args[i])
+    if type(arg) == "table" and arg[METHOD_DEFINITION_SYMBOL] then
+      arg.addToTraitOrInstance(instance, true)
+    else
+      error("deftrait: Invalid argument")
+    end
+  end
+
+  for k, v in pairs(instance.methods) do
+    if not v.wrappedFunc then
+      error("instance: Missing method definition " .. k)
+    end
+  end
+
+  ntype.instances[eTraitName] = instance
+end)
+
+local extends = funcify(function(ctx, name)
+  local eName = eval(ctx, name)
+  if not ctx.traits[eName] then
+    error("extends: No trait named " .. eName)
+  end
+  return {
+    [EXTENDS_SYMBOL] = true,
+    name = eName
+  }
+end)
+
+local method = funcify(function(ctx, traitName, value, methodName, ...)
+  local eValue = eval(ctx, value)
+  if not (type(eValue) == "table" and eValue[INSTATIATED_TYPE_SYMBOL]) then
+    error("method: Not an instatiated type")
+  end
+
+  local eTraitName = eval(ctx, traitName)
+  local trait = eValue.type.instances[eTraitName]
+  if not trait then
+    if ctx.traits[eTraitName] then
+      error("method: Instance does not implement trait " .. eTraitName)
+    else
+      error("method: No trait named " .. eTraitName)
+    end
+  end
+
+  local eMethodName = eval(ctx, methodName)
+  local method = trait.methods[eMethodName]
+  if not method then
+    error("method: No method named " .. eMethodName)
+  end
+
+  return eval(ctx, method.wrappedFunc, value, ...)
+end)
+
+local isInstance = funcify(function(ctx, typeName, traitName)
+  local eTypeName = eval(ctx, typeName)
+  local eTraitName = eval(ctx, traitName)
+  local ntype = ctx.types[eTypeName]
+  local trait = ctx.traits[eTraitName]
+  if not ntype then
+    error("isInstance: No type named " .. eTypeName)
+  end
+  if not trait then
+    error("isInstance: No trait named " .. eTraitName)
+  end
+
+  local instances = ctx.instances[eTypeName]
+  if not instances then
+    return false
+  end
+
+  local instance = instances[eTraitName]
+  return instance and true or false
+end)
 
 --
 
@@ -710,6 +880,12 @@ local environment = {
   any = any,
   _ = any, -- Alias
   t = t,
+  defmethod = defmethod,
+  deftrait = deftrait,
+  instance = instance,
+  extends = extends,
+  method = method,
+  isInstance = isInstance,
   luaf = luaf,
   luaftbl = luaftbl,
   add = add,
