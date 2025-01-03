@@ -39,12 +39,12 @@ end
 
 local function eval(ctx, func, ...)
   local res = func
-  if type(func) == "function" then
+  if type(res) == "function" then
     local args = { ... }
     if #args > 0 then
       res = res(...)
     end
-    res = res(EVAL_SYMBOL)(ctx)
+    res = res(EVAL_SYMBOL, ctx)
   end
   if (type(res) == "table") and res[ARG_SYMBOL] and not ctx.disableArgumentResolution then
     return ctx.args[res.name]
@@ -80,7 +80,8 @@ local function funcify(func)
     return function(...)
       local margs = { ... }
       if margs[1] == EVAL_SYMBOL then
-        return function(ctx) return func(ctx, applyArgs(ctx, args)) end
+        local ctx = margs[2]
+        return func(ctx, applyArgs(ctx, args))
       else
         local allArgs = {}
         for k, v in ipairs(args) do
@@ -113,14 +114,13 @@ local function tblSeq(tbl)
 end
 
 local function strSeq(str)
-  local i = 1
   return {
     [SEQ_SYMBOL] = true,
-    at = function(j)
-      if j > #str then
+    at = function(i)
+      if i > #str then
         return SEQ_DONE_SYMBOL
       end
-      return str:sub(j, j)
+      return str:sub(i, i)
     end
   }
 end
@@ -129,15 +129,6 @@ local function iteratorSeq(it)
   local cache, i = {}, 1
   return {
     [SEQ_SYMBOL] = true,
-    next = function()
-      local value = it()
-      if value == SEQ_DONE_SYMBOL then
-        return SEQ_DONE_SYMBOL
-      end
-      cache[i] = value
-      i = i + 1
-      return value
-    end,
     at = function(j)
       if j < i then
         return cache[j]
@@ -245,9 +236,9 @@ local f = keyFunc(funcify(function(ctx, name, ...)
     error("f: No function named " .. name)
   end
   if #args == 0 then
-    return ctx.functions[name](EVAL_SYMBOL)(ctx)
+    return ctx.functions[name](EVAL_SYMBOL, ctx)
   else
-    return ctx.functions[name](...)(EVAL_SYMBOL)(ctx)
+    return ctx.functions[name](...)(EVAL_SYMBOL, ctx)
   end
 end))
 
@@ -1126,7 +1117,14 @@ end)
 
 --
 
-local num = luaf (tonumber)
+local num = funcify(function(ctx, value)
+  local eValue = eval(ctx, value)
+  local asNum = tonumber(eValue)
+  if not asNum then
+    error("num: Cannot convert to number")
+  end
+  return asNum
+end)
 
 --
 
