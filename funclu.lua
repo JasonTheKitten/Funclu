@@ -1,4 +1,5 @@
 local ANY_SYMBOL = {}
+local APPLY_SEQ_SYMBOL = {}
 local ARGS_SYMBOL = {}
 local ARG_SYMBOL = {}
 local CUSTOM_TYPE_SYMBOL = {}
@@ -45,10 +46,32 @@ local function eval(ctx, func, ...)
     end
     res = res(EVAL_SYMBOL)(ctx)
   end
-  if (type(res) == "table") and (res[ARG_SYMBOL] == true) and not ctx.disableArgumentResolution then
+  if (type(res) == "table") and res[ARG_SYMBOL] and not ctx.disableArgumentResolution then
     return ctx.args[res.name]
   end
   return res
+end
+
+local function applyArgs(ctx, args)
+  local appliedArgs = {}
+  for k, v in ipairs(args) do
+    if type(v) == "table" and v[APPLY_SEQ_SYMBOL] then
+      local seq = eval(ctx, v.seq)
+      local i = 1
+      while true do
+        local value = seq.at(i)
+        i = i + 1
+        if value == SEQ_DONE_SYMBOL then
+          break
+        end
+        table.insert(appliedArgs, value)
+      end
+    else
+      table.insert(appliedArgs, v)
+    end
+  end
+
+  return table.unpack(appliedArgs)
 end
 
 local function funcify(func)
@@ -57,7 +80,7 @@ local function funcify(func)
     return function(...)
       local margs = { ... }
       if margs[1] == EVAL_SYMBOL then
-        return function(ctx) return func(ctx, table.unpack(args)) end
+        return function(ctx) return func(ctx, applyArgs(ctx, args)) end
       else
         local allArgs = {}
         for k, v in ipairs(args) do
@@ -286,18 +309,19 @@ local argsF = funcify(function(ctx, ...)
   return { [ARGS_SYMBOL] = true, args = { ... } }
 end)
 
-local function createCtx()
+local function createCtx(args)
   return {
     functions = {},
     args = {},
     types = {},
     traits = {},
+    programArgs = args,
     disableArgumentResolution = false
   }
 end
 
-local function run(program)
-  eval(createCtx, program)
+local function run(program, args)
+  eval(createCtx(args), program)
 end
 
 --
@@ -715,6 +739,18 @@ local toseq = funcify(function(ctx, value)
   return seqify(eval(ctx, value))
 end)
 
+local applySeq = function(args)
+  local applyValue = {
+    [APPLY_SEQ_SYMBOL] = true,
+    seq = args
+  }
+  return setmetatable(applyValue, {
+    __call = function(_, ...)
+      return applyValue
+    end
+  })
+end
+
 --
 
 local and_ = funcify(function(ctx, ...)
@@ -895,11 +931,52 @@ local foldr = funcify(function(ctx, func, acc, args)
   return result
 end)
 
-local iterator = funcify(function(ctx)
-  local index = 0
+local iterator = funcify(function(ctx, start, stepSize, numSteps)
+  local index = eval(ctx, start) or 1
+  local size = eval(ctx, stepSize) or 1
+  local steps = eval(ctx, numSteps)
+  local i = 0
   return iteratorSeq(function()
-    index = index + 1
-    return index
+    i = i + 1
+    if steps and i > steps then
+      return SEQ_DONE_SYMBOL
+    end
+    local value = index
+    index = index + size
+    return value
+  end)
+end)
+
+local range = funcify(function(ctx, start, stop, stepSize)
+  local index = eval(ctx, start)
+  local stopIndex = eval(ctx, stop)
+  local size = eval(ctx, stepSize) or 1
+  local i = 0
+  return iteratorSeq(function()
+    i = i + 1
+    if (size > 0 and index > stopIndex) or (size < 0 and index < stopIndex)then
+      return SEQ_DONE_SYMBOL
+    end
+    local value = index
+    index = index + size
+    return value
+  end)
+end)
+
+local cycle = funcify(function(ctx, ...)
+  local args = {...}
+  local eArgs = {}
+  for k, v in ipairs(args) do
+    table.insert(eArgs, eval(ctx, v))
+  end
+
+  local i = 0
+  return iteratorSeq(function()
+    i = i + 1
+    if i > #eArgs then
+      i = 1
+    end
+    return eArgs[i]
   end)
 end)
 
@@ -1020,6 +1097,16 @@ local concat = funcify(function(ctx, ...)
   return seqToOriginal(newSeq, args[1])
 end)
 
+local count = funcify(function(ctx, args)
+  local mySeq = seqify(eval(ctx, args))
+  local i = 0
+  while mySeq.at(i + 1) ~= SEQ_DONE_SYMBOL do
+    i = i + 1
+  end
+
+  return i
+end)
+
 --
 
 local upper = luaf (string.upper)
@@ -1036,6 +1123,10 @@ local str = funcify(function(ctx, value)
   -- TODO: Is this a good default?
   return format(ctx, eValue)
 end)
+
+--
+
+local num = luaf (tonumber)
 
 --
 
@@ -1087,6 +1178,12 @@ end)
 
 --
 
+local getArgs = funcify(function(ctx)
+  return seqify(ctx.programArgs)
+end)
+
+--
+
 local environment = {
   exec = exec,
   wrap = wrap,
@@ -1127,6 +1224,7 @@ local environment = {
   neq = neq,
   seq = seq,
   toseq = toseq,
+  applySeq = applySeq,
   and_ = and_,
   or_ = or_,
   not_ = not_,
@@ -1146,6 +1244,8 @@ local environment = {
   foldl = foldl,
   foldr = foldr,
   iterator = iterator,
+  range = range,
+  cycle = cycle,
   take = take,
   skip = skip,
   head = head,
@@ -1153,14 +1253,17 @@ local environment = {
   subseq = subseq,
   splice = splice,
   concat = concat,
+  count = count,
   upper = upper,
   lower = lower,
   str = str,
+  num = num,
   tbl = tbl,
   withKeys = withKeys,
   newTbl = newTbl,
   keys = keys,
   values = values,
+  getArgs = getArgs,
 }
 
 local rtn = {}
@@ -1171,9 +1274,9 @@ local function install(env)
 end
 install(rtn)
 
-local function installAndRun(env)
+local function installAndRun(env, args)
   install(env)
-  local ctx = createCtx()
+  local ctx = createCtx(args)
   local func
   func = function(line)
     eval(ctx, line)
