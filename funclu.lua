@@ -10,6 +10,12 @@ local METHOD_DEFINITION_SYMBOL = {}
 local SEQ_SYMBOL = {}
 local SEQ_DONE_SYMBOL = {}
 
+local ISSUES_URL = "https://github.com/JasonTheKitten/Funclu/issues"
+
+--
+
+local enableDebug = false
+
 --
 
 local function cloneTable(tbl, recursive)
@@ -22,6 +28,16 @@ local function cloneTable(tbl, recursive)
     end
   end
   return newTbl
+end
+
+local function defaultTable(dest, src)
+  for k, v in pairs(src) do
+    if dest[k] == nil then
+      dest[k] = v
+    end
+  end
+
+  return dest
 end
 
 local function keyFunc(func)
@@ -76,12 +92,16 @@ end
 
 local function funcify(func)
   local f
-  f = function(args)
+  f = function(args, collectedCallSites)
     return function(...)
       local margs = { ... }
       if margs[1] == EVAL_SYMBOL then
         local ctx = margs[2]
-        return func(ctx, applyArgs(ctx, args))
+        local oldCallSites = ctx.debugRef[1]
+        ctx.debugRef[1] = collectedCallSites
+        local result = { func(ctx, applyArgs(ctx, args)) }
+        ctx.debugRef[1] = oldCallSites
+        return table.unpack(result)
       else
         local allArgs = {}
         for k, v in ipairs(args) do
@@ -91,12 +111,22 @@ local function funcify(func)
           table.insert(allArgs, v)
         end
 
-        return f(allArgs)
+        local mCollectedCallSites = cloneTable(collectedCallSites)
+        if enableDebug then
+          local ok, err = pcall(error, "Callsite Here", 3)
+          err = err or "" -- Get rid of annoying IDE warnings
+          local callsite = err:sub(1, err:find(": Callsite Here") - 1)
+          if callsite ~= "" then
+            mCollectedCallSites[callsite] = true
+          end
+        end
+
+        return f(allArgs, mCollectedCallSites)
       end
     end
   end
 
-  return f({})
+  return f({}, {})
 end
 
 --
@@ -300,19 +330,23 @@ local argsF = funcify(function(ctx, ...)
   return { [ARGS_SYMBOL] = true, args = { ... } }
 end)
 
-local function createCtx(args)
+local function createCtx(args, options)
+  local myOptions = defaultTable(options or {}, {
+    
+  })
   return {
     functions = {},
     args = {},
     types = {},
     traits = {},
+    debugRef = {},
     programArgs = args,
     disableArgumentResolution = false
   }
 end
 
-local function run(program, args)
-  eval(createCtx(args), program)
+local function run(program, args, options)
+  eval(createCtx(args, options), program)
 end
 
 --
@@ -1272,18 +1306,47 @@ local function install(env)
 end
 install(rtn)
 
-local function installAndRun(env, args)
+local function printCallSite(collectedCallSites)
+  print("---\nThe Funclu library reported an error. If you believe this is a Funclu bug, " ..
+    "please report it at " .. ISSUES_URL .. "\n---")
+
+  local hasCallSite = not not (pairs(collectedCallSites)(collectedCallSites))
+  if not hasCallSite then
+    print("No call site information available")
+    return
+  end
+  print("Potentially Relevant Call Sites:")
+  for callSite in pairs(collectedCallSites) do
+    print(callSite)
+  end
+end
+
+local function installAndRun(env, args, options)
   install(env)
-  local ctx = createCtx(args)
+  local ctx = createCtx(args, options)
   local func
   func = function(line)
-    eval(ctx, line)
+    if enableDebug then
+      ctx.debugRef = {{}}
+      local ok, err = pcall(eval, ctx, line)
+      if not ok then
+        printCallSite(ctx.debugRef[1])
+        error(err, -1)
+      end
+    else
+      eval(ctx, line)
+    end
     return func
   end
 
   return func
 end
 rtn.install = installAndRun
+
+rtn.enableDebug = function(b)
+  enableDebug = b ~= false
+  return rtn
+end
 
 rtn.custom = {
   funcify = funcify,
