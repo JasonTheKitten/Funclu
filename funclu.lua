@@ -432,6 +432,7 @@ local newtype = funcify(function(ctx, name, ...)
   local ntype = {
     [CUSTOM_TYPE_SYMBOL] = true,
     name = name,
+    module = ctx.currentModule,
     args = eArgs,
     instances = {}
   }
@@ -458,7 +459,7 @@ eq2i = function(ctx, a, b, argBinder)
     return false
   end
   if type(aValue) == "table" and aValue[INSTATIATED_TYPE_SYMBOL] then
-    if aValue.type ~= bValue.type or aValue.name ~= bValue.name then
+    if aValue.type ~= bValue.type or aValue.name ~= bValue.name or aValue.module ~= bValue.module then
       return false
     end
     for i = 1, #aValue.args do
@@ -926,19 +927,22 @@ end
 
 local and_ = funcify(function(ctx, ...)
   local args = { ... }
+  local lastVal
   for k, v in ipairs(args) do
-    if not eval(ctx, v) then
+    lastVal = eval(ctx, v)
+    if not lastVal then
       return false
     end
   end
-  return true
+  return lastVal
 end)
 
 local or_ = funcify(function(ctx, ...)
   local args = { ... }
   for k, v in ipairs(args) do
-    if eval(ctx, v) then
-      return true
+    local val = eval(ctx, v)
+    if val then
+      return val
     end
   end
   return false
