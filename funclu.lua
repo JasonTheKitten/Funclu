@@ -9,6 +9,7 @@ local INSTATIATED_TYPE_SYMBOL = {}
 local METHOD_DEFINITION_SYMBOL = {}
 local SEQ_SYMBOL = {}
 local SEQ_DONE_SYMBOL = {}
+local UNRESOLVED_KEY_SYMBOL = {}
 
 local ISSUES_URL = "https://github.com/JasonTheKitten/Funclu/issues"
 
@@ -40,13 +41,35 @@ local function defaultTable(dest, src)
   return dest
 end
 
+local nestedKeyFunc
+nestedKeyFunc = function(func, key, index, keyName)
+  local newKey = cloneTable(key)
+  keyName = keyName .. (#newKey == 0 and "" or ".") .. index
+  table.insert(newKey, index)
+
+  return setmetatable({}, {
+    __index = function(self, key)
+      if (type(key) == "table") then
+        if key == UNRESOLVED_KEY_SYMBOL then
+          return self()
+        end
+        -- Possibly a symbol. Maybe report in the future?
+        return
+      end
+      return nestedKeyFunc(func, newKey, key, keyName)
+    end,
+    __call = function(_, ...)
+      return func(newKey, keyName, ...)
+    end
+  })
+end
 local function keyFunc(func)
   return setmetatable({}, {
     __index = function(_, key)
-      return func(key)
+      return nestedKeyFunc(func, {}, key, "")
     end,
-    __call = function(_, ...)
-      return func(...)
+    __call = function(_, key, ...)
+      return func({key}, key, ...)
     end
   })
 end
@@ -82,6 +105,8 @@ local function applyArgs(ctx, args)
         end
         table.insert(appliedArgs, value)
       end
+    elseif type(v) == "table" and v[UNRESOLVED_KEY_SYMBOL] then
+      table.insert(appliedArgs, v())
     else
       table.insert(appliedArgs, v)
     end
@@ -115,7 +140,8 @@ local function funcify(func)
         if enableDebug then
           local ok, err = pcall(error, "Callsite Here", 3)
           err = err or "" -- Get rid of annoying IDE warnings
-          local callsite = err:sub(1, err:find(": Callsite Here") - 1)
+          local findIndex = err:find(": Callsite Here") or #err + 1
+          local callsite = err:sub(1, findIndex - 1)
           if callsite ~= "" then
             mCollectedCallSites[callsite] = true
           end
@@ -127,6 +153,65 @@ local function funcify(func)
   end
 
   return f({}, {})
+end
+--
+
+local function createDefaultDriver()
+  local driver = {}
+  driver.reduceModName = function(name) return name end
+  driver.loadmod = require
+
+  return driver
+end
+
+local function createBaseCtx(args, options)
+  local myOptions = defaultTable(options or {}, {
+    driver = createDefaultDriver(),
+  })
+  return {
+    options = myOptions,
+    loadedModFiles = {},
+    programArgs = args,
+    debugRef = {{}},
+  }
+end
+
+local function createCtxUsingBase(baseCtx)
+  local ctx = {
+    baseCtx = baseCtx,
+    functions = {},
+    args = {},
+    types = {},
+    traits = {},
+    moduleExports = {},
+    using = {
+      functions = {},
+      types = {},
+      traits = {},
+    },
+    currentModule = "",
+    disableArgumentResolution = false
+  }
+  for k, v in pairs(baseCtx) do
+    ctx[k] = v
+  end
+  return ctx
+end
+
+local function createCtx(args, options)
+  local baseCtx = createBaseCtx(args, options)
+  return createCtxUsingBase(baseCtx)
+end
+
+local exec = funcify(function(ctx, ...)
+  local funcs = { ... }
+  for k, v in ipairs(funcs) do
+    eval(ctx, v)
+  end
+end)
+
+local function run(program, args, options)
+  eval(createCtx(args, options), program)
 end
 
 --
@@ -245,13 +330,6 @@ local function luaftbl(func)
   end)
 end
 
-local exec = funcify(function(ctx, ...)
-  local funcs = { ... }
-  for k, v in ipairs(funcs) do
-    eval(ctx, v)
-  end
-end)
-
 local wrap = funcify(function(ctx, func)
   return func
 end)
@@ -260,16 +338,19 @@ local unwrap = funcify(function(ctx, func)
   return eval(ctx, func) -- TODO: Is this right?
 end)
 
-local f = keyFunc(funcify(function(ctx, name, ...)
+local f = keyFunc(funcify(function(ctx, name, nameStr, ...)
   local args = { ... }
-  if not ctx.functions[name] then
-    error("f: No function named " .. name)
+
+  local callFunc = #name == 1 and ctx.functions[name[1]] or ctx.using.functions[nameStr]
+  if callFunc then
+    if #args == 0 then
+      return callFunc(EVAL_SYMBOL, ctx)
+    else
+      return callFunc(...)(EVAL_SYMBOL, ctx)
+    end
   end
-  if #args == 0 then
-    return ctx.functions[name](EVAL_SYMBOL, ctx)
-  else
-    return ctx.functions[name](...)(EVAL_SYMBOL, ctx)
-  end
+
+  error("f: No function named " .. nameStr)
 end))
 
 local function wrapUserFunction(scopeCtx, argList, func)
@@ -323,31 +404,15 @@ local defn = funcify(function(ctx, ...)
 end)
 
 local a = keyFunc(funcify(function(ctx, name)
-  return { [ARG_SYMBOL] = true, name = name }
+  if #name ~= 1 then
+    error("a: Invalid argument")
+  end
+  return { [ARG_SYMBOL] = true, name = name[1] }
 end))
 
 local argsF = funcify(function(ctx, ...)
   return { [ARGS_SYMBOL] = true, args = { ... } }
 end)
-
-local function createCtx(args, options)
-  local myOptions = defaultTable(options or {}, {
-    
-  })
-  return {
-    functions = {},
-    args = {},
-    types = {},
-    traits = {},
-    debugRef = {},
-    programArgs = args,
-    disableArgumentResolution = false
-  }
-end
-
-local function run(program, args, options)
-  eval(createCtx(args, options), program)
-end
 
 --
 
@@ -458,8 +523,8 @@ local any = funcify(function(ctx, ...)
   return ANY_SYMBOL
 end)
 
-local typeConstructor = function(ctx, name, ...)
-  local ntype = ctx.types[name]
+local typeConstructor = function(ctx, name, nameStr, ...)
+  local ntype = (#name == 1 and ctx.types[name[1]]) or ctx.using.types[nameStr]
   if not ntype then
     error("t: No type named " .. name)
   end
@@ -543,8 +608,8 @@ local instance = funcify(function(ctx, typeName, traitName, ...)
   local args = {...}
   local eTypeName = eval(ctx, typeName)
   local eTraitName = eval(ctx, traitName)
-  local ntype = ctx.types[eTypeName]
-  local trait = ctx.traits[eTraitName]
+  local ntype = ctx.types[eTypeName] or ctx.using.types[eTypeName]
+  local trait = ctx.traits[eTraitName] or ctx.using.traits[eTraitName]
   
   if not ntype then
     error("instance: No type named " .. eTypeName)
@@ -642,6 +707,86 @@ end)
 
 --
 
+local function loadmodi(ctx, name)
+  local modName = eval(ctx, name)
+  local driver = ctx.options.driver
+  local reducedModName = driver.reduceModName(modName)
+  if ctx.loadedModFiles[reducedModName] == "loading" then
+    error("loadmod: Circular dependency detected")
+  end
+  if not ctx.loadedModFiles[reducedModName] then
+    local mod = driver.loadmod(reducedModName)
+    if not mod then
+      error("loadmod: Could not load module " .. modName)
+    end
+
+    local newCtx = createCtxUsingBase(ctx.baseCtx)
+    newCtx.currentModule = reducedModName
+    ctx.loadedModFiles[reducedModName] = "loading"
+    local oldCallSites = newCtx.debugRef[1]
+    newCtx.debugRef[1] = {}
+    eval(newCtx, mod)
+    newCtx.debugRef[1] = oldCallSites
+    ctx.loadedModFiles[reducedModName] = newCtx.moduleExports
+  end
+  
+  local allExports = ctx.loadedModFiles[reducedModName]
+  for eModName, v in pairs(allExports) do
+    for type, exports in pairs(v) do
+      for expName, value in pairs(exports) do
+        print(eModName .. "." .. expName)
+        ctx.using[type][eModName .. "." .. expName] = value
+      end
+    end
+  end
+end
+
+local loadmod = funcify(function(ctx, ...)
+  local args = { ... }
+  for k, v in ipairs(args) do
+    loadmodi(ctx, v)
+  end
+end)
+
+local modulename = funcify(function(ctx, name)
+  ctx.currentModule = eval(ctx, name) or ctx.currentModule
+  return ctx.currentModule
+end)
+
+local using = funcify(function(ctx, source, target)
+  local eSource = eval(ctx, source)
+  local eTarget = eval(ctx, target) or ""
+  for k, type in ipairs({ "functions", "types", "traits" }) do
+    ctx.using[type][eTarget] = ctx.using[type][eSource]
+    local asPrefixSource = eSource .. "."
+    local asPrefixTarget = eTarget == "" and "" or eTarget .. "."
+    for expName, value in pairs(ctx.using[type]) do
+      if expName:sub(1, #asPrefixSource) == asPrefixSource then
+        ctx.using[type][asPrefixTarget .. expName:sub(#asPrefixSource + 1)] = value
+      end
+    end
+  end
+end)
+
+local export = funcify(function(ctx, type, ...)
+  local args = { ... }
+  ctx.moduleExports[ctx.currentModule] = ctx.moduleExports[ctx.currentModule] or {
+    functions = {},
+    types = {},
+    traits = {},
+  }
+  for k, v in ipairs(args) do
+    local name = eval(ctx, v)
+    ctx.moduleExports[ctx.currentModule][type][name] = ctx[type][name]
+  end
+end)
+
+local exportsf = export "functions"
+local exportst = export "types"
+local exportstr = export "traits"
+
+--
+
 local format
 format = function(ctx, rawValue)
   local value = eval(ctx, rawValue)
@@ -735,6 +880,7 @@ local eq = funcify(function(ctx, ...)
 end)
 
 local lt = funcify(function(ctx, a, b)
+  if type(a) == "table" then print("T") for k, v in pairs(a) do print(k, v) end end
   return eval(ctx, a) < eval(ctx, b)
 end)
 
@@ -1218,13 +1364,13 @@ end)
 
 local environment = {
   exec = exec,
+  run = run,
   wrap = wrap,
   unwrap = unwrap,
   f = f,
   defn = defn,
   a = a,
   args = argsF,
-  run = run,
   newtype = newtype,
   eq2 = eq2,
   member = member,
@@ -1238,6 +1384,12 @@ local environment = {
   extends = extends,
   method = method,
   isInstance = isInstance,
+  loadmod = loadmod,
+  modulename = modulename,
+  using = using,
+  exportsf = exportsf,
+  exportst = exportst,
+  exportstr = exportstr,
   luaf = luaf,
   luaftbl = luaftbl,
   add = add,
@@ -1327,7 +1479,7 @@ local function installAndRun(env, args, options)
   local func
   func = function(line)
     if enableDebug then
-      ctx.debugRef = {{}}
+      ctx.debugRef[1] = {}
       local ok, err = pcall(eval, ctx, line)
       if not ok then
         printCallSite(ctx.debugRef[1])
@@ -1342,6 +1494,11 @@ local function installAndRun(env, args, options)
   return func
 end
 rtn.install = installAndRun
+
+rtn.modules = function(env)
+  install(env)
+  return exec
+end
 
 rtn.enableDebug = function(b)
   enableDebug = b ~= false
