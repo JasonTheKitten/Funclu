@@ -89,6 +89,19 @@ local function tblSeq(tbl)
   }
 end
 
+local function strSeq(str)
+  local i = 1
+  return {
+    [SEQ_SYMBOL] = true,
+    at = function(j)
+      if j > #str then
+        return SEQ_DONE_SYMBOL
+      end
+      return str:sub(j, j)
+    end
+  }
+end
+
 local function iteratorSeq(it)
   local cache, i = {}, 1
   return {
@@ -119,26 +132,48 @@ local function iteratorSeq(it)
   }
 end
 
-local function seqToTable(seq)
+local function seqToTable(seq, refTbl)
   if not seq[SEQ_SYMBOL] then
     return seq -- Already in normal table form
   end
 
-  local result, running, i = {}, true, 1
+  local newTbl = {}
+  for k, v in pairs(refTbl or {}) do
+    if type(k) ~= "number" then
+      newTbl[k] = v
+    end
+  end
+
+  local running, i = true, 1
   while running do
     local value = seq.at(i)
     i = i + 1
     if value == SEQ_DONE_SYMBOL then
       running = false
     else
-      table.insert(result, value)
+      table.insert(newTbl, value)
     end
   end
-  return result
+
+  return newTbl
+end
+
+local function seqToOriginal(seq, ref)
+  if type(ref) == "table" and ref[SEQ_SYMBOL] then
+    return seq
+  elseif type(ref) == "table" then
+    return seqToTable(seq, ref)
+  elseif type(ref) == "string" then
+    return table.concat(seqToTable(seq))
+  else
+    error("Cannot convert sequence to type " .. type(ref))
+  end
 end
 
 local function seqify(tbl)
-  if not tbl[SEQ_SYMBOL] then
+  if type(tbl) == "string" then
+    return strSeq(tbl)
+  elseif not tbl[SEQ_SYMBOL] then
     return tblSeq(tbl)
   end
   return tbl
@@ -146,15 +181,23 @@ end
 
 --
 
+local function evalAll(ctx, ...)
+  local args = { ... }
+  for i = 1, #args do
+    args[i] = eval(ctx, args[i])
+  end
+  return table.unpack(args)
+end
+
 local function luaf(func)
   return funcify(function(ctx, ...)
-    return func(...)
+    return func(evalAll(ctx, ...))
   end)
 end
 
 local function luaftbl(func)
   return funcify(function(ctx, ...)
-    return tblSeq({ func(...) })
+    return tblSeq({ func(evalAll(ctx, ...)) })
   end)
 end
 
@@ -321,7 +364,12 @@ end)
 
 local member = funcify(function(ctx, name, value)
   local eValue = eval(ctx, value)
-  if not (type(eValue) == "table" and eValue[INSTATIATED_TYPE_SYMBOL]) then
+
+  if type(eValue) == "table" and not eValue[INSTATIATED_TYPE_SYMBOL] then
+    return eValue[name]
+  end
+
+  if type(eValue) ~= "table" then
     error("member: Not an instatiated type")
   end
   local ntype = eValue.type
@@ -663,6 +711,10 @@ local seq = funcify(function(ctx, ...)
   return tblSeq({ ... })
 end)
 
+local toseq = funcify(function(ctx, value)
+  return seqify(eval(ctx, value))
+end)
+
 --
 
 local and_ = funcify(function(ctx, ...)
@@ -766,9 +818,10 @@ end)
 --
 
 local map = funcify(function(ctx, func, args)
-  local cache, index = {}, 1
-  local myArgs = seqify(eval(ctx, args))
-  return {
+  local cache = {}
+  local initialVal = eval(ctx, args)
+  local myArgs = seqify(initialVal)
+  local newSeq = {
     [SEQ_SYMBOL] = true,
     at = function(i)
       if not cache[i] then
@@ -781,11 +834,14 @@ local map = funcify(function(ctx, func, args)
       return cache[i]
     end
   }
+
+  return seqToOriginal(newSeq, initialVal)
 end)
 
 local filter = funcify(function(ctx, func, args)
   local cache, index, innerIndex = {}, 1, 1
-  local myArgs = seqify(eval(ctx, args))
+  local initialVal = eval(ctx, args)
+  local myArgs = seqify(initialVal)
 
   local function next()
     while true do
@@ -802,7 +858,7 @@ local filter = funcify(function(ctx, func, args)
     end
   end
 
-  return {
+  local newSeq = {
     [SEQ_SYMBOL] = true,
     at = function(i)
       if cache[i] then
@@ -819,6 +875,8 @@ local filter = funcify(function(ctx, func, args)
       return cache[i]
     end
   }
+
+  return seqToOriginal(newSeq, initialVal)
 end)
 
 local foldl = funcify(function(ctx, func, acc, args)
@@ -847,19 +905,184 @@ end)
 
 local take = funcify(function(ctx, n, args)
   local maxN = eval(ctx, n)
-  local myArgs = seqify(eval(ctx, args))
+  local initialVal = eval(ctx, args)
+  local myArgs = seqify(initialVal)
   local i = 0
-  return iteratorSeq(function()
+  local newSeq = iteratorSeq(function()
     i = i + 1
     if i > maxN then
       return SEQ_DONE_SYMBOL
     end
     return myArgs.at(i)
   end)
+
+  return seqToOriginal(newSeq, initialVal)
+end)
+
+local skip = funcify(function(ctx, n, args)
+  local minN = eval(ctx, n)
+  local initialVal = eval(ctx, args)
+  local mySeq = seqify(initialVal)
+  local newSeq = {
+    [SEQ_SYMBOL] = true,
+    at = function(i)
+      return mySeq.at(i + minN)
+    end
+  }
+
+  return seqToOriginal(newSeq, initialVal)
 end)
 
 local head = funcify(function(ctx, args)
-  return eval(ctx, args).at(1)
+  return seqify(eval(ctx, args)).at(1)
+end)
+
+local tail = funcify(function(ctx, args)
+  local initialVal = eval(ctx, args)
+  local mySeq = seqify(initialVal)
+  local newSeq = {
+    [SEQ_SYMBOL] = true,
+    at = function(i)
+      return mySeq.at(i + 1)
+    end
+  }
+  return seqToOriginal(newSeq, initialVal)
+end)
+
+local subseq = funcify(function(ctx, start, num, args)
+  local initialVal = eval(ctx, args)
+  local mySeq = seqify(initialVal)
+  local newSeq = {
+    [SEQ_SYMBOL] = true,
+    at = function(i)
+      if i > num then
+        return SEQ_DONE_SYMBOL
+      end
+      return mySeq.at(i + start - 1)
+    end
+  }
+  return seqToOriginal(newSeq, initialVal)
+end)
+
+local splice = funcify(function(ctx, start, num, args)
+  local initialVal = eval(ctx, args)
+  local mySeq = seqify(initialVal)
+  local newSeq = {
+    [SEQ_SYMBOL] = true,
+    at = function(i)
+      if i < start then
+        return mySeq.at(i)
+      end
+      return mySeq.at(i + num)
+    end
+  }
+  return seqToOriginal(newSeq, initialVal)
+end)
+
+local concat = funcify(function(ctx, ...)
+  local args = {}
+  for k, v in ipairs({ ... }) do
+    table.insert(args, eval(ctx, v))
+  end
+  local subseqs = {}
+  for k, v in ipairs(args) do
+    table.insert(subseqs, seqify(v))
+  end
+  local newSeq = {
+    [SEQ_SYMBOL] = true,
+    at = function(i)
+      local offset = 0
+      for k, v in ipairs(subseqs) do
+        local value = v.at(i - offset)
+        if value == SEQ_DONE_SYMBOL then
+          offset = offset + #seqToTable(v)
+        else
+          return value
+        end
+      end
+      return SEQ_DONE_SYMBOL
+    end
+  }
+
+  if type(args[1]) == "table" and not args[1][SEQ_SYMBOL] then
+    local result = seqToTable(newSeq, args[1])
+    for i = 2, #args do
+      if type(args[i]) == "table" and not args[1][SEQ_SYMBOL] then
+        for k, v in pairs(args[i]) do
+          if type(k) ~= "number" then
+            result[k] = v
+          end
+        end
+      end
+    end
+  end
+
+  return seqToOriginal(newSeq, args[1])
+end)
+
+--
+
+local upper = luaf (string.upper)
+local lower = luaf (string.lower)
+
+local str = funcify(function(ctx, value)
+  local eValue = eval(ctx, value)
+  if type(eValue) == "string" then
+    return eValue
+  end
+  if type(eValue) == "table" and eValue[SEQ_SYMBOL] then
+    return table.concat(seqToTable(eValue))
+  end
+  -- TODO: Is this a good default?
+  return format(ctx, eValue)
+end)
+
+--
+
+local tbl = funcify(function(ctx, value)
+  local eValue = eval(ctx, value)
+  if eValue == nil then
+    return {}
+  end
+  if type(eValue) == "table" and eValue[SEQ_SYMBOL] then
+    return seqToTable(eValue)
+  end
+  if type(eValue) == "table" then
+    return eValue
+  end
+  error("tbl: Don't know how to convert to table")
+end)
+
+local withKeys = funcify(function(ctx, value, ...)
+  local args = { ... }
+  local mtbl = cloneTable(eval(ctx, value), true)
+  for i = 1, #args, 2 do
+    local key = eval(ctx, args[i])
+    local value = eval(ctx, args[i + 1])
+    mtbl[key] = value
+  end
+
+  return mtbl
+end)
+
+local newTbl = withKeys {}
+
+local keys = funcify(function(ctx, value)
+  local eValue = eval(ctx, value)
+  local keyList = {}
+  for k, v in pairs(eValue) do
+    table.insert(keyList, k)
+  end
+  return tblSeq(keyList)
+end)
+
+local values = funcify(function(ctx, value)
+  local eValue = eval(ctx, value)
+  local valueList = {}
+  for k, v in pairs(eValue) do
+    table.insert(valueList, v)
+  end
+  return tblSeq(valueList)
 end)
 
 --
@@ -903,6 +1126,7 @@ local environment = {
   gte = gte,
   neq = neq,
   seq = seq,
+  toseq = toseq,
   and_ = and_,
   or_ = or_,
   not_ = not_,
@@ -923,7 +1147,20 @@ local environment = {
   foldr = foldr,
   iterator = iterator,
   take = take,
+  skip = skip,
   head = head,
+  tail = tail,
+  subseq = subseq,
+  splice = splice,
+  concat = concat,
+  upper = upper,
+  lower = lower,
+  str = str,
+  tbl = tbl,
+  withKeys = withKeys,
+  newTbl = newTbl,
+  keys = keys,
+  values = values,
 }
 
 local rtn = {}
