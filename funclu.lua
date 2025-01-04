@@ -171,11 +171,13 @@ local function createBaseCtx(args, options)
   return {
     options = myOptions,
     loadedModFiles = {},
+    autoloadMods = {},
     programArgs = args,
     debugRef = {{}},
   }
 end
 
+local importMod
 local function createCtxUsingBase(baseCtx)
   local ctx = {
     baseCtx = baseCtx,
@@ -195,6 +197,9 @@ local function createCtxUsingBase(baseCtx)
   for k, v in pairs(baseCtx) do
     ctx[k] = v
   end
+  for k, v in pairs(ctx.autoloadMods) do
+    importMod(ctx, ctx.loadedModFiles[v])
+  end
   return ctx
 end
 
@@ -211,7 +216,16 @@ local exec = funcify(function(ctx, ...)
 end)
 
 local function run(program, args, options)
-  eval(createCtx(args, options), program)
+  local ctx = createCtx(args, options)
+  options = options or {}
+
+  local builtinMods = options.builtinMods or {}
+  for modName, mod in pairs(builtinMods) do
+    ctx.loadedModFiles[modName] = mod
+    table.insert(ctx.autoloadMods, modName)
+  end
+
+  eval(ctx, program)
 end
 
 --
@@ -334,8 +348,8 @@ local wrap = funcify(function(ctx, func)
   return func
 end)
 
-local unwrap = funcify(function(ctx, func)
-  return eval(ctx, func) -- TODO: Is this right?
+local unwrap = funcify(function(ctx, func, ...)
+  return eval(ctx, eval(ctx, func)(...)) -- TODO: Is this right?
 end)
 
 local f = keyFunc(funcify(function(ctx, name, nameStr, ...)
@@ -431,8 +445,7 @@ local newtype = funcify(function(ctx, name, ...)
 
   local ntype = {
     [CUSTOM_TYPE_SYMBOL] = true,
-    name = name,
-    module = ctx.currentModule,
+    name = (ctx.currentModule ~= "" and ctx.currentModule .. "." or "") .. name,
     args = eArgs,
     instances = {}
   }
@@ -459,7 +472,7 @@ eq2i = function(ctx, a, b, argBinder)
     return false
   end
   if type(aValue) == "table" and aValue[INSTATIATED_TYPE_SYMBOL] then
-    if aValue.type ~= bValue.type or aValue.name ~= bValue.name or aValue.module ~= bValue.module then
+    if aValue.type ~= bValue.type or aValue.name ~= bValue.name then
       return false
     end
     for i = 1, #aValue.args do
@@ -527,7 +540,7 @@ end)
 local typeConstructor = function(ctx, name, nameStr, ...)
   local ntype = (#name == 1 and ctx.types[name[1]]) or ctx.using.types[nameStr]
   if not ntype then
-    error("t: No type named " .. name)
+    error("t: No type named " .. nameStr)
   end
 
   local args = { ... }
@@ -535,10 +548,15 @@ local typeConstructor = function(ctx, name, nameStr, ...)
     error("t: Incorrect number of arguments")
   end
 
+  local eArgs = {}
+  for i = 1, #args do
+    table.insert(eArgs, eval(ctx, args[i]))
+  end
+
   return {
     [INSTATIATED_TYPE_SYMBOL] = true,
     type = ntype,
-    args = args
+    args = eArgs
   }
 end
 local t = keyFunc(funcify(typeConstructor))
@@ -548,8 +566,9 @@ local t = keyFunc(funcify(typeConstructor))
 local deftrait = funcify(function(ctx, name, ...)
   local args = { ... }
   local traitName = eval(ctx, name)
+  local fullName = (ctx.currentModule ~= "" and ctx.currentModule .. "." or "") .. traitName
   local trait = {
-    name = traitName,
+    name = fullName,
     methods = {},
     extends = {}
   }
@@ -618,7 +637,7 @@ local instance = funcify(function(ctx, typeName, traitName, ...)
   if not trait then
     error("instance: No trait named " .. eTraitName)
   end
-  if ntype.instances[eTraitName] then
+  if ntype.instances[trait.name] then
     error("instance: Instance already exists")
   end
   for _, extendedTraitName in ipairs(trait.extends) do
@@ -646,30 +665,32 @@ local instance = funcify(function(ctx, typeName, traitName, ...)
     end
   end
 
-  ntype.instances[eTraitName] = instance
+  ntype.instances[trait.name] = instance
 end)
 
 local extends = funcify(function(ctx, name)
   local eName = eval(ctx, name)
-  if not ctx.traits[eName] then
+  local trait = ctx.traits[eName] or ctx.using.traits[eName]
+  if not trait then
     error("extends: No trait named " .. eName)
   end
   return {
     [EXTENDS_SYMBOL] = true,
-    name = eName
+    name = trait.name
   }
 end)
 
-local method = funcify(function(ctx, traitName, value, methodName, ...)
+local method = funcify(function(ctx, traitName, methodName, value,  ...)
   local eValue = eval(ctx, value)
   if not (type(eValue) == "table" and eValue[INSTATIATED_TYPE_SYMBOL]) then
     error("method: Not an instatiated type")
   end
 
   local eTraitName = eval(ctx, traitName)
-  local trait = eValue.type.instances[eTraitName]
+  local ntrait = ctx.traits[eTraitName] or ctx.using.traits[eTraitName]
+  local trait = eValue.type.instances[(ntrait or {}).name]
   if not trait then
-    if ctx.traits[eTraitName] then
+    if ntrait then
       error("method: Instance does not implement trait " .. eTraitName)
     else
       error("method: No trait named " .. eTraitName)
@@ -689,7 +710,7 @@ local isInstance = funcify(function(ctx, typeName, traitName)
   local eTypeName = eval(ctx, typeName)
   local eTraitName = eval(ctx, traitName)
   local ntype = ctx.types[eTypeName]
-  local trait = ctx.traits[eTraitName]
+  local trait = ctx.traits[eTraitName] or ctx.using.traits[eTraitName]
   if not ntype then
     error("isInstance: No type named " .. eTypeName)
   end
@@ -697,7 +718,7 @@ local isInstance = funcify(function(ctx, typeName, traitName)
     error("isInstance: No trait named " .. eTraitName)
   end
 
-  local instances = ctx.instances[eTypeName]
+  local instances = ctx.instances[ntype.name]
   if not instances then
     return false
   end
@@ -707,6 +728,28 @@ local isInstance = funcify(function(ctx, typeName, traitName)
 end)
 
 --
+
+local function execMod(ctx, modName, mod)
+  local newCtx = createCtxUsingBase(ctx.baseCtx)
+  newCtx.currentModule = modName
+  ctx.loadedModFiles[modName] = "loading"
+  local oldCallSites = newCtx.debugRef[1]
+  newCtx.debugRef[1] = {}
+  eval(newCtx, mod)
+  newCtx.debugRef[1] = oldCallSites
+
+  return newCtx.moduleExports
+end
+
+importMod = function(ctx, allExports)
+  for eModName, v in pairs(allExports) do
+    for type, exports in pairs(v) do
+      for expName, value in pairs(exports) do
+        ctx.using[type][eModName .. "." .. expName] = value
+      end
+    end
+  end
+end
 
 local function loadmodi(ctx, name)
   local modName = eval(ctx, name)
@@ -720,26 +763,11 @@ local function loadmodi(ctx, name)
     if not mod then
       error("loadmod: Could not load module " .. modName)
     end
-
-    local newCtx = createCtxUsingBase(ctx.baseCtx)
-    newCtx.currentModule = reducedModName
-    ctx.loadedModFiles[reducedModName] = "loading"
-    local oldCallSites = newCtx.debugRef[1]
-    newCtx.debugRef[1] = {}
-    eval(newCtx, mod)
-    newCtx.debugRef[1] = oldCallSites
-    ctx.loadedModFiles[reducedModName] = newCtx.moduleExports
+    
+    ctx.loadedModFiles[reducedModName] = execMod(ctx, reducedModName, mod)
   end
   
-  local allExports = ctx.loadedModFiles[reducedModName]
-  for eModName, v in pairs(allExports) do
-    for type, exports in pairs(v) do
-      for expName, value in pairs(exports) do
-        print(eModName .. "." .. expName)
-        ctx.using[type][eModName .. "." .. expName] = value
-      end
-    end
-  end
+  importMod(ctx, ctx.loadedModFiles[reducedModName])
 end
 
 local loadmod = funcify(function(ctx, ...)
@@ -747,6 +775,14 @@ local loadmod = funcify(function(ctx, ...)
   for k, v in ipairs(args) do
     loadmodi(ctx, v)
   end
+end)
+
+local customMod = funcify(function(ctx, name, ...)
+  local modName = eval(ctx, name)
+  local modCode = exec(...)
+  ctx.loadedModFiles[modName] = execMod(ctx, modName, modCode)
+
+  importMod(ctx, ctx.loadedModFiles[modName])
 end)
 
 local modulename = funcify(function(ctx, name)
@@ -761,10 +797,14 @@ local using = funcify(function(ctx, source, target)
     ctx.using[type][eTarget] = ctx.using[type][eSource]
     local asPrefixSource = eSource .. "."
     local asPrefixTarget = eTarget == "" and "" or eTarget .. "."
+    local newUsing = {} -- Table modifications during iteration cause random issues
     for expName, value in pairs(ctx.using[type]) do
       if expName:sub(1, #asPrefixSource) == asPrefixSource then
-        ctx.using[type][asPrefixTarget .. expName:sub(#asPrefixSource + 1)] = value
+        newUsing[asPrefixTarget .. expName:sub(#asPrefixSource + 1)] = value
       end
+    end
+    for expName, value in pairs(newUsing) do
+      ctx.using[type][expName] = value
     end
   end
 end)
@@ -881,7 +921,6 @@ local eq = funcify(function(ctx, ...)
 end)
 
 local lt = funcify(function(ctx, a, b)
-  if type(a) == "table" then print("T") for k, v in pairs(a) do print(k, v) end end
   return eval(ctx, a) < eval(ctx, b)
 end)
 
@@ -1366,6 +1405,26 @@ end)
 
 --
 
+local builtinLib = customMod "builtin"
+  (deftrait "alternative"
+    (defmethod "|" (argsF "other")))
+  (deftrait "monad"
+    (extends "alternative")
+    (defmethod ">>=" (argsF "transform"))
+    (defmethod ">>" (argsF "next")))
+  (newtype "just" "a")
+  (newtype "empty")
+  (newtype "left" "a")
+  (newtype "right" "b")
+  (newtype "failure" "reason")
+  (defn ">>=" (method "monad" ">>="))
+  (defn ">>" (method "monad" ">>"))
+  (exportst "just" "empty" "left" "right" "failure")
+  (exportstr "alternative" "monad")
+  (exportsf ">>=" ">>")
+
+--
+
 local environment = {
   exec = exec,
   run = run,
@@ -1480,6 +1539,8 @@ end
 local function installAndRun(env, args, options)
   install(env)
   local ctx = createCtx(args, options)
+  eval(ctx, builtinLib)
+  table.insert(ctx.autoloadMods, "builtin")
   local func
   func = function(line)
     if enableDebug then
@@ -1512,6 +1573,9 @@ end
 rtn.custom = {
   funcify = funcify,
   eval = eval,
+  customMod = customMod,
+  execMod = execMod,
+  importMod = importMod,
 }
 
 return rtn
