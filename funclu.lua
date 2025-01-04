@@ -2,6 +2,8 @@ local ANY_SYMBOL = {}
 local APPLY_SEQ_SYMBOL = {}
 local ARGS_SYMBOL = {}
 local ARG_SYMBOL = {}
+local BIND_SYMBOL = {}
+local BIND_VALUE_SYMBOL = {}
 local CUSTOM_TYPE_SYMBOL = {}
 local EVAL_SYMBOL = {}
 local EXTENDS_SYMBOL = {}
@@ -617,15 +619,10 @@ local typeConstructor = function(ctx, name, nameStr, ...)
     error("t: Incorrect number of arguments")
   end
 
-  local eArgs = {}
-  for i = 1, #args do
-    table.insert(eArgs, args[i])
-  end
-
   return {
     [INSTATIATED_TYPE_SYMBOL] = true,
     type = ntype,
-    args = eArgs
+    args = args
   }
 end
 local t = keyFunc(funcify(typeConstructor))
@@ -1443,6 +1440,66 @@ end, 1)
 
 --
 
+local function createBinder(typeSymbol)
+  return function(name)
+    return function(value)
+      local bindValue = {
+        [typeSymbol] = true,
+        name = name,
+        value = value
+      }
+      return setmetatable(bindValue, {
+        __call = function(_, ...)
+          return bindValue
+        end
+      })
+    end
+  end
+end
+
+local bind = createBinder(BIND_SYMBOL)
+local bindval = createBinder(BIND_VALUE_SYMBOL)
+
+local block = funcify(function(ctx, ...)
+  local bindOp = eval(ctx, method, "builtin.monad", ">>=")
+  local nextOp = eval(ctx, method, "builtin.monad", ">>")
+
+  local args = { ... }
+  if #args == 0 then
+    error("block: No arguments")
+  end
+
+  local lastValue = args[#args]
+  if (type(lastValue) == "table") and (lastValue[BIND_SYMBOL] or lastValue[BIND_VALUE_SYMBOL]) then
+    for k, v in pairs(lastValue) do
+      print(k, v)
+    end
+    error("block: Last value of block cannot be a bind")
+  end
+
+  if #args == 1 then return lastValue end
+  for i = #args - 1, 1, -1 do
+    local value = args[i]
+    if type(value) == "table" and value[BIND_SYMBOL] then
+      local scopeCtx = deriveScopeCtx(ctx)
+      local transformerFunction = wrapUserFunction(scopeCtx, { value.name }, lastValue)
+      lastValue = bindOp(value.value, transformerFunction)
+    elseif type(value) == "table" and value[BIND_VALUE_SYMBOL] then
+      local margs = { value.name, value.value, lastValue }
+      while args[i - 1] and type(args[i - 1]) == "table" and args[i - 1][BIND_VALUE_SYMBOL] do
+        table.insert(margs, 1, args[i - 1].name)
+        table.insert(margs, 2, args[i - 1].value)
+        i = i - 1
+      end
+      lastValue = with(table.unpack(margs))
+    else
+      lastValue = nextOp(value, lastValue)
+    end
+  end
+
+  return lastValue
+end, nil, true)
+
 local getArgs = funcify(function(ctx)
   return seqify(ctx.programArgs)
 end, 0)
@@ -1555,6 +1612,9 @@ local environment = {
   newTbl = newTbl,
   keys = keys,
   values = values,
+  bind = bind,
+  bindval = bindval,
+  block = block,
   getArgs = getArgs,
 }
 
