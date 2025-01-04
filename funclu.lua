@@ -9,6 +9,7 @@ local INSTATIATED_TYPE_SYMBOL = {}
 local METHOD_DEFINITION_SYMBOL = {}
 local SEQ_SYMBOL = {}
 local SEQ_DONE_SYMBOL = {}
+local SKIP_EVAL_SYMBOL = {}
 local UNRESOLVED_KEY_SYMBOL = {}
 
 local ISSUES_URL = "https://github.com/JasonTheKitten/Funclu/issues"
@@ -88,7 +89,18 @@ local function eval(ctx, func, ...)
   if (type(res) == "table") and res[ARG_SYMBOL] and not ctx.disableArgumentResolution then
     return ctx.args[res.name]
   end
+  if (type(res) == "table") and res[SKIP_EVAL_SYMBOL] then
+    return res.value
+  end
   return res
+end
+
+local function evalAll(ctx, args)
+  local eArgs = {}
+  for i = 1, #args do
+    eArgs[i] = eval(ctx, args[i])
+  end
+  return eArgs
 end
 
 local function applyArgs(ctx, args)
@@ -112,21 +124,59 @@ local function applyArgs(ctx, args)
     end
   end
 
-  return table.unpack(appliedArgs)
+  return appliedArgs
 end
 
-local function funcify(func)
+local funcify
+local function evalFunction(ctx, func, eArgs, disableAutoEval, argsData)
+  local completed =
+    (type(argsData) == "number" and #eArgs >= argsData)
+    or (type(argsData) ~= "number")
+
+  if completed then
+    local result, actual = func(ctx, table.unpack(eArgs))
+    actual = actual or (type(argsData) == "number" and argsData) or #eArgs
+    if type(result) == "function" then
+      local remainingArgs = { select(actual + 1, table.unpack(eArgs)) }
+      -- TODO: Check if below logic is right
+      if #remainingArgs == 0 then
+        return result(EVAL_SYMBOL, ctx)
+      end
+      return result(table.unpack(remainingArgs))(EVAL_SYMBOL, ctx)
+    end
+    return result
+  end
+  
+  local remaining = argsData - #eArgs
+  return funcify(function(ctx, ...)
+    local margs = { ... }
+    local allArgs = {}
+    for k, v in ipairs(eArgs) do
+      table.insert(allArgs, { [SKIP_EVAL_SYMBOL] = true, value = v })
+    end
+    for k, v in ipairs(margs) do
+      table.insert(allArgs, v)
+    end
+    return evalFunction(ctx, func, evalAll(ctx, allArgs), remaining)
+  end, remaining, disableAutoEval, ctx.debugRef[1])
+end
+
+funcify = function(func, argsData, disableAutoEval, extraCallSites)
   local f
   f = function(args, collectedCallSites)
     return function(...)
       local margs = { ... }
       if margs[1] == EVAL_SYMBOL then
         local ctx = margs[2]
+        local eArgs = applyArgs(ctx, args)
+        if not disableAutoEval then
+          eArgs = evalAll(ctx, eArgs)
+        end
         local oldCallSites = ctx.debugRef[1]
         ctx.debugRef[1] = collectedCallSites
-        local result = { func(ctx, applyArgs(ctx, args)) }
+        local result = evalFunction(ctx, func, eArgs, disableAutoEval, argsData)
         ctx.debugRef[1] = oldCallSites
-        return table.unpack(result)
+        return result
       else
         local allArgs = {}
         for k, v in ipairs(args) do
@@ -152,7 +202,8 @@ local function funcify(func)
     end
   end
 
-  return f({}, {})
+  
+  return f({}, cloneTable(extraCallSites or {}))
 end
 --
 
@@ -206,6 +257,29 @@ end
 local function createCtx(args, options)
   local baseCtx = createBaseCtx(args, options)
   return createCtxUsingBase(baseCtx)
+end
+
+local function deriveScopeCtx(ctx)
+  local newCtx = {
+    baseCtx = ctx.baseCtx,
+    functions = cloneTable(ctx.functions),
+    args = cloneTable(ctx.args),
+    types = cloneTable(ctx.types),
+    traits = cloneTable(ctx.traits),
+    moduleExports = cloneTable(ctx.moduleExports),
+    using = {
+      functions = cloneTable(ctx.using.functions),
+      types = cloneTable(ctx.using.types),
+      traits = cloneTable(ctx.using.traits),
+    },
+    currentModule = ctx.currentModule,
+    disableArgumentResolution = ctx.disableArgumentResolution
+  }
+  for k, v in pairs(ctx) do
+    newCtx[k] = v
+  end
+
+  return newCtx
 end
 
 local exec = funcify(function(ctx, ...)
@@ -324,17 +398,9 @@ end
 
 --
 
-local function evalAll(ctx, ...)
-  local args = { ... }
-  for i = 1, #args do
-    args[i] = eval(ctx, args[i])
-  end
-  return table.unpack(args)
-end
-
 local function luaf(func)
   return funcify(function(ctx, ...)
-    return func(evalAll(ctx, ...))
+    return func(table.unpack(evalAll(ctx, { ... })))
   end)
 end
 
@@ -346,11 +412,15 @@ end
 
 local wrap = funcify(function(ctx, func)
   return func
-end)
+end, 1)
 
 local unwrap = funcify(function(ctx, func, ...)
-  return eval(ctx, eval(ctx, func)(...)) -- TODO: Is this right?
+  return eval(ctx, func(...)) -- TODO: Is this right?
 end)
+
+local only = funcify(function(ctx, optValue)
+  return optValue, optValue and 1 or 0
+end, 0)
 
 local f = keyFunc(funcify(function(ctx, name, nameStr, ...)
   local args = { ... }
@@ -372,7 +442,7 @@ local function wrapUserFunction(scopeCtx, argList, func)
     local innerArgs = { ... }
     local namedArgs = {}
     for i = 1, #argList do
-      namedArgs[argList[i]] = eval(ctx2, table.remove(innerArgs, 1))
+      namedArgs[argList[i]] = table.remove(innerArgs, 1)
     end
     -- TODO: What should be inherited from ctx, and what should be inherited from ctx2?
     local newCtx = cloneTable(scopeCtx)
@@ -381,9 +451,10 @@ local function wrapUserFunction(scopeCtx, argList, func)
       newCtx.args[k] = v
     end
     return eval(newCtx, func, table.unpack(innerArgs))
-  end)
+  end, #argList)
 end
 
+-- TODO: Nameless defn for some reason doesn't work as intended. Use "" as name instead.
 local defn = funcify(function(ctx, ...)
   local args  = { ... }
   
@@ -407,15 +478,15 @@ local defn = funcify(function(ctx, ...)
   end
   argList = argList.args
   
-  local scopeCtx = cloneTable(ctx, true)
+  local scopeCtx = deriveScopeCtx(ctx)
   local wrappedFunc = wrapUserFunction(scopeCtx, argList, func)
   if name ~= "" then
     ctx.functions[name] = wrappedFunc
     scopeCtx.functions[name] = wrappedFunc
   end
 
-  return wrappedFunc -- TODO: This does not actually work as intended
-end)
+  return wrappedFunc, index
+end, 1, true)
 
 local a = keyFunc(funcify(function(ctx, name)
   if #name ~= 1 then
@@ -433,13 +504,13 @@ end)
 local newtype = funcify(function(ctx, name, ...)
   local args = { ... }
   local eArgs = {}
-  local firstArg = #args > 0 and eval(ctx, args[1]) or nil
+  local firstArg = #args > 0 and args[1] or nil
   if firstArg and type(firstArg) == "table" and firstArg[ARGS_SYMBOL] then
     eArgs = args[1].args
   else
     table.insert(eArgs, firstArg)
     for i = 2, #args do
-      table.insert(eArgs, eval(ctx, args[i]))
+      table.insert(eArgs, args[i])
     end
   end
 
@@ -472,7 +543,7 @@ eq2i = function(ctx, a, b, argBinder)
     return false
   end
   if type(aValue) == "table" and aValue[INSTATIATED_TYPE_SYMBOL] then
-    if aValue.type ~= bValue.type or aValue.name ~= bValue.name then
+    if aValue.type ~= bValue.type then
       return false
     end
     for i = 1, #aValue.args do
@@ -488,28 +559,26 @@ end
 
 local eq2 = funcify(function(ctx, a, b)
   return eq2i(ctx, a, b)
-end)
+end, 2)
 
 local member = funcify(function(ctx, name, value)
-  local eValue = eval(ctx, value)
-
-  if type(eValue) == "table" and not eValue[INSTATIATED_TYPE_SYMBOL] then
-    return eValue[name]
+  if type(value) == "table" and not value[INSTATIATED_TYPE_SYMBOL] then
+    return value[name]
   end
 
-  if type(eValue) ~= "table" then
+  if type(value) ~= "table" then
     error("member: Not an instatiated type")
   end
-  local ntype = eValue.type
+  local ntype = value.type
 
   for i = 1, #ntype.args do
     if ntype.args[i] == name then
-      return eValue.args[i]
+      return value.args[i]
     end
   end
 
   error("member: No member named " .. name)
-end)
+end, 2)
 
 local match = funcify(function(ctx, value, ...)
   local args = { ... }
@@ -531,11 +600,11 @@ local match = funcify(function(ctx, value, ...)
       return eval(newCtx, nextArg)
     end
   end
-end)
+end, nil, true)
 
-local any = funcify(function(ctx, ...)
+local any = funcify(function(ctx)
   return ANY_SYMBOL
-end)
+end, 0)
 
 local typeConstructor = function(ctx, name, nameStr, ...)
   local ntype = (#name == 1 and ctx.types[name[1]]) or ctx.using.types[nameStr]
@@ -550,7 +619,7 @@ local typeConstructor = function(ctx, name, nameStr, ...)
 
   local eArgs = {}
   for i = 1, #args do
-    table.insert(eArgs, eval(ctx, args[i]))
+    table.insert(eArgs, args[i])
   end
 
   return {
@@ -563,9 +632,8 @@ local t = keyFunc(funcify(typeConstructor))
 
 --
 
-local deftrait = funcify(function(ctx, name, ...)
+local deftrait = funcify(function(ctx, traitName, ...)
   local args = { ... }
-  local traitName = eval(ctx, name)
   local fullName = (ctx.currentModule ~= "" and ctx.currentModule .. "." or "") .. traitName
   local trait = {
     name = fullName,
@@ -573,7 +641,7 @@ local deftrait = funcify(function(ctx, name, ...)
     extends = {}
   }
   for i = 1, #args do
-    local arg = eval(ctx, args[i])
+    local arg = args[i]
     if type(arg) == "table" and arg[METHOD_DEFINITION_SYMBOL] then
       arg.addToTraitOrInstance(trait)
     elseif type(arg) == "table" and arg[EXTENDS_SYMBOL] then
@@ -606,7 +674,7 @@ local defmethod = funcify(function(ctx, name, ...)
 
   local wrappedFunc
   if func then
-    local scopeCtx = cloneTable(ctx, true)
+    local scopeCtx = deriveScopeCtx(ctx)
     wrappedFunc = wrapUserFunction(scopeCtx, argList, func)
   end
 
@@ -621,21 +689,19 @@ local defmethod = funcify(function(ctx, name, ...)
         wrappedFunc = wrappedFunc
       }
     end
-  }
-end)
+  }, args[2] and 2 or 1
+end, nil, true)
 
 local instance = funcify(function(ctx, typeName, traitName, ...)
   local args = {...}
-  local eTypeName = eval(ctx, typeName)
-  local eTraitName = eval(ctx, traitName)
-  local ntype = ctx.types[eTypeName] or ctx.using.types[eTypeName]
-  local trait = ctx.traits[eTraitName] or ctx.using.traits[eTraitName]
+  local ntype = ctx.types[typeName] or ctx.using.types[typeName]
+  local trait = ctx.traits[traitName] or ctx.using.traits[traitName]
   
   if not ntype then
-    error("instance: No type named " .. eTypeName)
+    error("instance: No type named " .. typeName)
   end
   if not trait then
-    error("instance: No trait named " .. eTraitName)
+    error("instance: No trait named " .. traitName)
   end
   if ntype.instances[trait.name] then
     error("instance: Instance already exists")
@@ -651,7 +717,7 @@ local instance = funcify(function(ctx, typeName, traitName, ...)
   }
 
   for i = 1, #args do
-    local arg = eval(ctx, args[i])
+    local arg = args[i]
     if type(arg) == "table" and arg[METHOD_DEFINITION_SYMBOL] then
       arg.addToTraitOrInstance(instance, true)
     else
@@ -669,53 +735,47 @@ local instance = funcify(function(ctx, typeName, traitName, ...)
 end)
 
 local extends = funcify(function(ctx, name)
-  local eName = eval(ctx, name)
-  local trait = ctx.traits[eName] or ctx.using.traits[eName]
+  local trait = ctx.traits[name] or ctx.using.traits[name]
   if not trait then
-    error("extends: No trait named " .. eName)
+    error("extends: No trait named " .. name)
   end
   return {
     [EXTENDS_SYMBOL] = true,
     name = trait.name
   }
-end)
+end, 1)
 
-local method = funcify(function(ctx, traitName, methodName, value,  ...)
-  local eValue = eval(ctx, value)
-  if not (type(eValue) == "table" and eValue[INSTATIATED_TYPE_SYMBOL]) then
+local method = funcify(function(ctx, traitName, methodName, value)
+  if not (type(value) == "table" and value[INSTATIATED_TYPE_SYMBOL]) then
     error("method: Not an instatiated type")
   end
 
-  local eTraitName = eval(ctx, traitName)
-  local ntrait = ctx.traits[eTraitName] or ctx.using.traits[eTraitName]
-  local trait = eValue.type.instances[(ntrait or {}).name]
+  local ntrait = ctx.traits[traitName] or ctx.using.traits[traitName]
+  local trait = value.type.instances[(ntrait or {}).name]
   if not trait then
     if ntrait then
-      error("method: Instance does not implement trait " .. eTraitName)
+      error("method: Instance does not implement trait " .. traitName)
     else
-      error("method: No trait named " .. eTraitName)
+      error("method: No trait named " .. traitName)
     end
   end
 
-  local eMethodName = eval(ctx, methodName)
-  local method = trait.methods[eMethodName]
+  local method = trait.methods[methodName]
   if not method then
-    error("method: No method named " .. eMethodName)
+    error("method: No method named " .. methodName)
   end
 
-  return eval(ctx, method.wrappedFunc, value, ...)
-end)
+  return method.wrappedFunc(value)
+end, 3)
 
 local isInstance = funcify(function(ctx, typeName, traitName)
-  local eTypeName = eval(ctx, typeName)
-  local eTraitName = eval(ctx, traitName)
-  local ntype = ctx.types[eTypeName]
-  local trait = ctx.traits[eTraitName] or ctx.using.traits[eTraitName]
+  local ntype = ctx.types[typeName]
+  local trait = ctx.traits[traitName] or ctx.using.traits[traitName]
   if not ntype then
-    error("isInstance: No type named " .. eTypeName)
+    error("isInstance: No type named " .. typeName)
   end
   if not trait then
-    error("isInstance: No trait named " .. eTraitName)
+    error("isInstance: No trait named " .. traitName)
   end
 
   local instances = ctx.instances[ntype.name]
@@ -723,9 +783,9 @@ local isInstance = funcify(function(ctx, typeName, traitName)
     return false
   end
 
-  local instance = instances[eTraitName]
+  local instance = instances[traitName]
   return instance and true or false
-end)
+end, 2)
 
 --
 
@@ -783,20 +843,19 @@ local customMod = funcify(function(ctx, name, ...)
   ctx.loadedModFiles[modName] = execMod(ctx, modName, modCode)
 
   importMod(ctx, ctx.loadedModFiles[modName])
-end)
+end, nil, true)
 
 local modulename = funcify(function(ctx, name)
-  ctx.currentModule = eval(ctx, name) or ctx.currentModule
+  ctx.currentModule = name or ctx.currentModule
   return ctx.currentModule
-end)
+end, 1)
 
 local using = funcify(function(ctx, source, target)
-  local eSource = eval(ctx, source)
-  local eTarget = eval(ctx, target) or ""
+  target = target or ""
   for k, type in ipairs({ "functions", "types", "traits" }) do
-    ctx.using[type][eTarget] = ctx.using[type][eSource]
-    local asPrefixSource = eSource .. "."
-    local asPrefixTarget = eTarget == "" and "" or eTarget .. "."
+    ctx.using[type][target] = ctx.using[type][source]
+    local asPrefixSource = source .. "."
+    local asPrefixTarget = target == "" and "" or target .. "."
     local newUsing = {} -- Table modifications during iteration cause random issues
     for expName, value in pairs(ctx.using[type]) do
       if expName:sub(1, #asPrefixSource) == asPrefixSource then
@@ -807,7 +866,7 @@ local using = funcify(function(ctx, source, target)
       ctx.using[type][expName] = value
     end
   end
-end)
+end, 1)
 
 local export = funcify(function(ctx, type, ...)
   local args = { ... }
@@ -817,7 +876,7 @@ local export = funcify(function(ctx, type, ...)
     traits = {},
   }
   for k, v in ipairs(args) do
-    local name = eval(ctx, v)
+    local name = v
     ctx.moduleExports[ctx.currentModule][type][name] = ctx[type][name]
   end
 end)
@@ -829,8 +888,7 @@ local exportstr = export "traits"
 --
 
 local format
-format = function(ctx, rawValue)
-  local value = eval(ctx, rawValue)
+format = function(ctx, value)
   if type(value) == "table" and value[SEQ_SYMBOL] then
     local result, first, running, i = "(seq ", true, true, 1
     while running do
@@ -866,41 +924,41 @@ local add = funcify(function(ctx, ...)
   local args = { ... }
   local sum = 0
   for k, v in ipairs(args) do
-    sum = sum + eval(ctx, v)
+    sum = sum + v
   end
   return sum
-end)
+end, 2)
 
 local sub = funcify(function(ctx, ...)
   local args = { ... }
-  local diff = eval(ctx, args[1])
+  local diff = args[1]
   for i = 2, #args do
-    diff = diff - eval(ctx, args[i])
+    diff = diff - args[i]
   end
   return diff
-end)
+end, 2)
 
 local mul = funcify(function(ctx, ...)
   local args = { ... }
   local product = 1
   for k, v in ipairs(args) do
-    product = product * eval(ctx, v)
+    product = product * v
   end
   return product
 end)
 
 local div = funcify(function(ctx, ...)
   local args = { ... }
-  local quotient = eval(ctx, args[1])
+  local quotient = args[1]
   for i = 2, #args do
-    quotient = quotient / eval(ctx, args[i])
+    quotient = quotient / args[i]
   end
   return quotient
 end)
 
 local mod = funcify(function(ctx, a, b)
-  return eval(ctx, a) % eval(ctx, b)
-end)
+  return a % b
+end, 2)
 
 local inc = add (1)
 local dec = add (-1)
@@ -910,10 +968,10 @@ local neg = mul (-1)
 
 local eq = funcify(function(ctx, ...)
   local args = { ... }
-  local value = eval(ctx, args[1])
+  local value = args[1]
   for i = 2, #args do
     local v = args[i]
-    if value ~= eval(ctx, v) then
+    if value ~= v then
       return false
     end
   end
@@ -921,24 +979,24 @@ local eq = funcify(function(ctx, ...)
 end)
 
 local lt = funcify(function(ctx, a, b)
-  return eval(ctx, a) < eval(ctx, b)
-end)
+  return a < b
+end, 2)
 
 local gt = funcify(function(ctx, a, b)
-  return eval(ctx, a) > eval(ctx, b)
+  return a > b
 end)
 
 local lte = funcify(function(ctx, a, b)
-  return eval(ctx, a) <= eval(ctx, b)
-end)
+  return a <= b
+end, 2)
 
 local gte = funcify(function(ctx, a, b)
-  return eval(ctx, a) >= eval(ctx, b)
-end)
+  return a >= b
+end, 2)
 
 local neq = funcify(function(ctx, a, b)
-  return eval(ctx, a) ~= eval(ctx, b)
-end)
+  return a ~= b
+end, 2)
 
 --
 
@@ -947,8 +1005,8 @@ local seq = funcify(function(ctx, ...)
 end)
 
 local toseq = funcify(function(ctx, value)
-  return seqify(eval(ctx, value))
-end)
+  return seqify(value)
+end, 1)
 
 local applySeq = function(args)
   local applyValue = {
@@ -968,7 +1026,7 @@ local and_ = funcify(function(ctx, ...)
   local args = { ... }
   local lastVal
   for k, v in ipairs(args) do
-    lastVal = eval(ctx, v)
+    lastVal = v
     if not lastVal then
       return false
     end
@@ -979,7 +1037,7 @@ end)
 local or_ = funcify(function(ctx, ...)
   local args = { ... }
   for k, v in ipairs(args) do
-    local val = eval(ctx, v)
+    local val = v
     if val then
       return val
     end
@@ -988,12 +1046,12 @@ local or_ = funcify(function(ctx, ...)
 end)
 
 local not_ = funcify(function(ctx, a)
-  return not eval(ctx, a)
-end)
+  return not a
+end, 1)
 
 local xor = funcify(function(ctx, a, b)
-  return eval(ctx, a) ~= eval(ctx, b)
-end)
+  return a ~= b
+end, 2)
 
 --
 
@@ -1041,7 +1099,7 @@ local cond = funcify(function(ctx, ...)
       return eval(ctx, nextArg)
     end
   end
-end)
+end, nil, true)
 
 local with = funcify(function(ctx, ...)
   local args = {...}
@@ -1054,7 +1112,7 @@ local with = funcify(function(ctx, ...)
 
   local func = args[#args]
   return eval(newCtx, func)
-end)
+end, nil, true)
 
 local prints = funcify(function(ctx, ...)
   local args = { ... }
@@ -1067,15 +1125,14 @@ end)
 
 --
 
-local map = funcify(function(ctx, func, args)
+local map = funcify(function(ctx, func, initialVal)
   local cache = {}
-  local initialVal = eval(ctx, args)
   local myArgs = seqify(initialVal)
   local newSeq = {
     [SEQ_SYMBOL] = true,
     at = function(i)
       if not cache[i] then
-        local value = eval(ctx, myArgs.at(i))
+        local value = myArgs.at(i)
         if value == SEQ_DONE_SYMBOL then
           return SEQ_DONE_SYMBOL
         end
@@ -1086,11 +1143,10 @@ local map = funcify(function(ctx, func, args)
   }
 
   return seqToOriginal(newSeq, initialVal)
-end)
+end, 2)
 
-local filter = funcify(function(ctx, func, args)
+local filter = funcify(function(ctx, func, initialVal)
   local cache, index, innerIndex = {}, 1, 1
-  local initialVal = eval(ctx, args)
   local myArgs = seqify(initialVal)
 
   local function next()
@@ -1127,44 +1183,43 @@ local filter = funcify(function(ctx, func, args)
   }
 
   return seqToOriginal(newSeq, initialVal)
-end)
+end, 2)
 
 local foldl = funcify(function(ctx, func, acc, args)
-  local result = eval(ctx, acc)
-  for k, v in ipairs(seqToTable(eval(ctx, args))) do
-    result = func(result, eval(ctx, v))
+  local result = acc
+  for k, v in ipairs(seqToTable(args)) do
+    result = eval(ctx, func, result, v)
   end
   return result
-end)
+end, 3)
 
 local foldr = funcify(function(ctx, func, acc, args)
-  local result = eval(ctx, acc)
-  for k, v in ipairs(seqToTable(eval(ctx, args))) do
-    result = func(eval(ctx, v), result)
+  local result = acc
+  local tbl = seqToTable(args)
+  for i = #tbl, 1, -1 do
+    result = eval(ctx, func, tbl[i], result)
   end
   return result
-end)
+end, 3)
 
 local iterator = funcify(function(ctx, start, stepSize, numSteps)
-  local index = eval(ctx, start) or 1
-  local size = eval(ctx, stepSize) or 1
-  local steps = eval(ctx, numSteps)
+  local index = start or 1
   local i = 0
   return iteratorSeq(function()
     i = i + 1
-    if steps and i > steps then
+    if numSteps and i > numSteps then
       return SEQ_DONE_SYMBOL
     end
     local value = index
-    index = index + size
+    index = index + (stepSize or 1)
     return value
-  end)
+  end), #{start, stepSize, numSteps}
 end)
 
 local range = funcify(function(ctx, start, stop, stepSize)
-  local index = eval(ctx, start)
-  local stopIndex = eval(ctx, stop)
-  local size = eval(ctx, stepSize) or 1
+  local index = start
+  local stopIndex = stop
+  local size = stepSize or 1
   local i = 0
   return iteratorSeq(function()
     i = i + 1
@@ -1174,14 +1229,14 @@ local range = funcify(function(ctx, start, stop, stepSize)
     local value = index
     index = index + size
     return value
-  end)
-end)
+  end), #{start, stop, stepSize}
+end, 2)
 
 local cycle = funcify(function(ctx, ...)
   local args = {...}
   local eArgs = {}
   for k, v in ipairs(args) do
-    table.insert(eArgs, eval(ctx, v))
+    table.insert(eArgs, v)
   end
 
   local i = 0
@@ -1194,42 +1249,37 @@ local cycle = funcify(function(ctx, ...)
   end)
 end)
 
-local take = funcify(function(ctx, n, args)
-  local maxN = eval(ctx, n)
-  local initialVal = eval(ctx, args)
+local take = funcify(function(ctx, n, initialVal)
   local myArgs = seqify(initialVal)
   local i = 0
   local newSeq = iteratorSeq(function()
     i = i + 1
-    if i > maxN then
+    if i > n then
       return SEQ_DONE_SYMBOL
     end
     return myArgs.at(i)
   end)
 
   return seqToOriginal(newSeq, initialVal)
-end)
+end, 2)
 
-local skip = funcify(function(ctx, n, args)
-  local minN = eval(ctx, n)
-  local initialVal = eval(ctx, args)
+local skip = funcify(function(ctx, n, initialVal)
   local mySeq = seqify(initialVal)
   local newSeq = {
     [SEQ_SYMBOL] = true,
     at = function(i)
-      return mySeq.at(i + minN)
+      return mySeq.at(i + n)
     end
   }
 
   return seqToOriginal(newSeq, initialVal)
-end)
+end, 2)
 
 local head = funcify(function(ctx, args)
-  return seqify(eval(ctx, args)).at(1)
-end)
+  return seqify(args).at(1)
+end, 1)
 
-local tail = funcify(function(ctx, args)
-  local initialVal = eval(ctx, args)
+local tail = funcify(function(ctx, initialVal)
   local mySeq = seqify(initialVal)
   local newSeq = {
     [SEQ_SYMBOL] = true,
@@ -1238,10 +1288,9 @@ local tail = funcify(function(ctx, args)
     end
   }
   return seqToOriginal(newSeq, initialVal)
-end)
+end, 1)
 
-local subseq = funcify(function(ctx, start, num, args)
-  local initialVal = eval(ctx, args)
+local subseq = funcify(function(ctx, start, num, initialVal)
   local mySeq = seqify(initialVal)
   local newSeq = {
     [SEQ_SYMBOL] = true,
@@ -1253,10 +1302,9 @@ local subseq = funcify(function(ctx, start, num, args)
     end
   }
   return seqToOriginal(newSeq, initialVal)
-end)
+end, 3)
 
-local splice = funcify(function(ctx, start, num, args)
-  local initialVal = eval(ctx, args)
+local splice = funcify(function(ctx, start, num, initialVal)
   local mySeq = seqify(initialVal)
   local newSeq = {
     [SEQ_SYMBOL] = true,
@@ -1268,13 +1316,10 @@ local splice = funcify(function(ctx, start, num, args)
     end
   }
   return seqToOriginal(newSeq, initialVal)
-end)
+end, 3)
 
 local concat = funcify(function(ctx, ...)
-  local args = {}
-  for k, v in ipairs({ ... }) do
-    table.insert(args, eval(ctx, v))
-  end
+  local args = { ... }
   local subseqs = {}
   for k, v in ipairs(args) do
     table.insert(subseqs, seqify(v))
@@ -1311,67 +1356,67 @@ local concat = funcify(function(ctx, ...)
   return seqToOriginal(newSeq, args[1])
 end)
 
-local count = funcify(function(ctx, args)
-  local mySeq = seqify(eval(ctx, args))
+local count = funcify(function(ctx, seq)
+  local mySeq = seqify(seq)
   local i = 0
   while mySeq.at(i + 1) ~= SEQ_DONE_SYMBOL do
     i = i + 1
   end
 
   return i
-end)
+end, 1)
 
 --
 
 local upper = luaf (string.upper)
 local lower = luaf (string.lower)
 
-local str = funcify(function(ctx, value)
-  local eValue = eval(ctx, value)
-  if type(eValue) == "string" then
-    return eValue
+local str = funcify(function(ctx, ...)
+  local args = { ... }
+  local str = ""
+  for k, v in ipairs(args) do
+    if type(v) == "string" then
+      str = str .. v
+    elseif type(v) == "table" and v[SEQ_SYMBOL] then
+      str = str .. table.concat(seqToTable(v))
+    else
+      str = str .. format(ctx, v)
+    end
   end
-  if type(eValue) == "table" and eValue[SEQ_SYMBOL] then
-    return table.concat(seqToTable(eValue))
-  end
-  -- TODO: Is this a good default?
-  return format(ctx, eValue)
-end)
+
+  return str
+end, 1)
 
 --
 
 local num = funcify(function(ctx, value)
-  local eValue = eval(ctx, value)
-  local asNum = tonumber(eValue)
+  local asNum = tonumber(value)
   if not asNum then
     error("num: Cannot convert to number")
   end
   return asNum
-end)
+end, 1)
 
 --
 
 local tbl = funcify(function(ctx, value)
-  local eValue = eval(ctx, value)
-  if eValue == nil then
+  if value == nil then
     return {}
   end
-  if type(eValue) == "table" and eValue[SEQ_SYMBOL] then
-    return seqToTable(eValue)
+  if type(value) == "table" and value[SEQ_SYMBOL] then
+    return seqToTable(value)
   end
-  if type(eValue) == "table" then
-    return eValue
+  if type(value) == "table" then
+    return value
   end
   error("tbl: Don't know how to convert to table")
-end)
+end, 1)
 
 local withKeys = funcify(function(ctx, value, ...)
   local args = { ... }
-  local mtbl = cloneTable(eval(ctx, value), true)
+  local mtbl = cloneTable(value, true)
   for i = 1, #args, 2 do
-    local key = eval(ctx, args[i])
-    local value = eval(ctx, args[i + 1])
-    mtbl[key] = value
+    mtbl[args[i]] = args[i + 1]
   end
 
   return mtbl
@@ -1386,22 +1431,21 @@ local keys = funcify(function(ctx, value)
     table.insert(keyList, k)
   end
   return tblSeq(keyList)
-end)
+end, 1)
 
 local values = funcify(function(ctx, value)
-  local eValue = eval(ctx, value)
   local valueList = {}
-  for k, v in pairs(eValue) do
+  for k, v in pairs(value) do
     table.insert(valueList, v)
   end
   return tblSeq(valueList)
-end)
+end, 1)
 
 --
 
 local getArgs = funcify(function(ctx)
   return seqify(ctx.programArgs)
-end)
+end, 0)
 
 --
 
@@ -1430,6 +1474,7 @@ local environment = {
   run = run,
   wrap = wrap,
   unwrap = unwrap,
+  only = only,
   f = f,
   defn = defn,
   a = a,
