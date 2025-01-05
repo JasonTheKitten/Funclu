@@ -4,14 +4,15 @@ local ARGS_SYMBOL = {}
 local ARG_SYMBOL = {}
 local BIND_SYMBOL = {}
 local BIND_VALUE_SYMBOL = {}
+local NATIVE_TYPE_SYMBOL = {}
 local CUSTOM_TYPE_SYMBOL = {}
 local EVAL_SYMBOL = {}
 local EXTENDS_SYMBOL = {}
 local INSTATIATED_TYPE_SYMBOL = {}
 local METHOD_DEFINITION_SYMBOL = {}
+local SCOPED_ARG_SYMBOL = {}
 local SEQ_SYMBOL = {}
 local SEQ_DONE_SYMBOL = {}
-local SKIP_EVAL_SYMBOL = {}
 local UNRESOLVED_KEY_SYMBOL = {}
 
 local ISSUES_URL = "https://github.com/JasonTheKitten/Funclu/issues"
@@ -79,8 +80,19 @@ end
 
 --
 
+local function removeEvalWrapper(res)
+  while (type(res) == "table") and res[SCOPED_ARG_SYMBOL] do
+    res = res.value
+  end
+  return res
+end
+
 local function eval(ctx, func, ...)
   local res = func
+  while (type(res) == "table") and res[SCOPED_ARG_SYMBOL] do
+    ctx = res.ctx
+    res = res.value
+  end
   if type(res) == "function" then
     local args = { ... }
     if #args > 0 then
@@ -91,18 +103,49 @@ local function eval(ctx, func, ...)
   if (type(res) == "table") and res[ARG_SYMBOL] and not ctx.disableArgumentResolution then
     return ctx.args[res.name]
   end
-  if (type(res) == "table") and res[SKIP_EVAL_SYMBOL] then
-    return res.value
-  end
   return res
 end
 
-local function evalAll(ctx, args)
+local function evalMany(ctx, args, num)
   local eArgs = {}
-  for i = 1, #args do
+  for i = 1, (num or #args) do
     eArgs[i] = eval(ctx, args[i])
   end
   return eArgs
+end
+
+local function scopeArg(ctx, arg)
+  if (type(arg) ~= "table") and (type(arg) ~= "function") then
+    return arg
+  end
+  if (type(arg) == "table") and (arg[SCOPED_ARG_SYMBOL] or arg[ARG_SYMBOL]) then
+    return arg
+  end
+  return {
+    [SCOPED_ARG_SYMBOL] = true,
+    ctx = ctx,
+    value = arg
+  }
+end
+
+local function rescopeArg(ctx, arg)
+  return scopeArg(ctx, removeEvalWrapper(arg))
+end
+
+local function applyWithinScope(func, args)
+  if type(func) == "function" then
+    return func(table.unpack(args))
+  end
+  if type(removeEvalWrapper(func)) == "function" then
+    return scopeArg(func.ctx, removeEvalWrapper(func)(args))
+  end
+  return func
+end
+local function evalIfApplied(ctx, func, args)
+  if #args == 0 then
+    return func
+  end
+  return eval(ctx, applyWithinScope(func, args))
 end
 
 local function applyArgs(ctx, args)
@@ -136,15 +179,28 @@ local function evalFunction(ctx, func, eArgs, disableAutoEval, argsData)
     or (type(argsData) ~= "number")
 
   if completed then
+    if disableAutoEval then
+      -- Only resolve arguments if we're not auto-evaluating
+      for i = 1, #eArgs do
+        if type(eArgs[i]) == "table" and eArgs[i][ARG_SYMBOL] then
+          eArgs[i] = eval(ctx, eArgs[i])
+        end
+      end
+    else
+      if type(argsData) == "number" then
+        for i = 1, argsData do
+          eArgs[i] = eval(ctx, eArgs[i])
+        end
+      else
+        error("Variadic args with auto eval not supported")
+      end
+    end
     local result, actual = func(ctx, table.unpack(eArgs))
     actual = actual or (type(argsData) == "number" and argsData) or #eArgs
-    if type(result) == "function" then
+    if type(removeEvalWrapper(result)) == "function" then
       local remainingArgs = { select(actual + 1, table.unpack(eArgs)) }
       -- TODO: Check if below logic is right
-      if #remainingArgs == 0 then
-        return result(EVAL_SYMBOL, ctx)
-      end
-      return result(table.unpack(remainingArgs))(EVAL_SYMBOL, ctx)
+      return evalIfApplied(ctx, result, remainingArgs)
     end
     return result
   end
@@ -154,16 +210,20 @@ local function evalFunction(ctx, func, eArgs, disableAutoEval, argsData)
     local margs = { ... }
     local allArgs = {}
     for k, v in ipairs(eArgs) do
-      table.insert(allArgs, { [SKIP_EVAL_SYMBOL] = true, value = v })
-    end
-    for k, v in ipairs(margs) do
       table.insert(allArgs, v)
     end
-    return evalFunction(ctx, func, evalAll(ctx, allArgs), remaining)
+    for k, v in ipairs(margs) do
+      table.insert(allArgs, scopeArg(ctx, v))
+    end
+    return evalFunction(ctx, func, allArgs, remaining)
   end, remaining, disableAutoEval, ctx.debugRef[1])
 end
 
 funcify = function(func, argsData, disableAutoEval, extraCallSites)
+  if not disableAutoEval and (type(argsData) ~= "number") then
+    error("Variadic args with auto eval not supported")
+  end
+
   local f
   f = function(args, collectedCallSites)
     return function(...)
@@ -171,8 +231,8 @@ funcify = function(func, argsData, disableAutoEval, extraCallSites)
       if margs[1] == EVAL_SYMBOL then
         local ctx = margs[2]
         local eArgs = applyArgs(ctx, args)
-        if not disableAutoEval then
-          eArgs = evalAll(ctx, eArgs)
+        for i = 1, #eArgs do
+          eArgs[i] = scopeArg(ctx, eArgs[i])
         end
         local oldCallSites = ctx.debugRef[1]
         ctx.debugRef[1] = collectedCallSites
@@ -289,7 +349,7 @@ local exec = funcify(function(ctx, ...)
   for k, v in ipairs(funcs) do
     eval(ctx, v)
   end
-end)
+end, nil, true)
 
 local function run(program, args, options)
   local ctx = createCtx(args, options)
@@ -306,12 +366,19 @@ end
 
 --
 
-local function tblSeq(tbl)
+local function tblSeq(tbl, lazyCtx)
+  local cache = lazyCtx and {} or nil
   return {
     [SEQ_SYMBOL] = true,
     at = function(i)
       if i > #tbl then
         return SEQ_DONE_SYMBOL
+      end
+      if cache and cache[i] then
+        return cache[i]
+      end
+      if cache then
+        cache[i] = eval(lazyCtx, tbl[i])
       end
       return tbl[i]
     end
@@ -400,72 +467,146 @@ end
 
 --
 
-local function luaf(func)
-  return funcify(function(ctx, ...)
-    return func(table.unpack(evalAll(ctx, { ... })))
-  end)
+local ioEffect
+local ioType = {
+  [CUSTOM_TYPE_SYMBOL] = true,
+  [NATIVE_TYPE_SYMBOL] = true,
+  name = "io",
+  args = {},
+  instances = {
+    ["builtin.alternative"] = {
+      methods = {
+        ["|"] = {
+          argList = { "self", "other" },
+          wrappedFunc = funcify(function(ctx, self, other)
+            return eval(ctx, self)
+          end, 2, true)
+        }
+      }
+    },
+    ["builtin.monad"] = {
+      methods = {
+        [">>="] = {
+          argList = { "self", "transform" },
+          wrappedFunc = funcify(function(ctx, self, transform)
+            return ioEffect(function()
+              local result = eval(ctx, self).effect(ctx)
+              return eval(ctx, transform, result)
+            end)
+          end, 2, true)
+        },
+        [">>"] = {
+          argList = { "self", "next" },
+          wrappedFunc = funcify(function(ctx, self, next)
+            return ioEffect(function()
+              eval(ctx, self).effect(ctx)
+              return eval(ctx, removeEvalWrapper(next))
+            end)
+          end, 2, true)
+        }
+      }
+    }
+  }
+}
+
+ioEffect = function(effect)
+  local errorStr = "Cannot access members of IO effect"
+  return {
+    [INSTATIATED_TYPE_SYMBOL] = true,
+    type = ioType,
+    argCount = function() error(errorStr) end,
+    argAt = function() error(errorStr) end,
+    effect = effect
+  }
 end
 
-local function luaftbl(func)
+local function ioFuncify(func, argData)
   return funcify(function(ctx, ...)
-    return tblSeq({ func(evalAll(ctx, ...)) })
-  end)
+    local args = { ... }
+    return ioEffect(function()
+      return func(ctx, table.unpack(evalMany(ctx, args)))
+    end)
+  end, argData, true)
+end
+
+local function isIoEffect(value)
+  return
+    type(value) == "table"
+    and value[INSTATIATED_TYPE_SYMBOL]
+    and (value.type == ioType)
+end
+
+--
+
+local function luaf(args)
+  return function(func)
+    return funcify(function(ctx, ...)
+      return func(... )
+    end, args)
+  end
+end
+
+local function luaftbl(args)
+  return function(func)
+    return funcify(function(ctx, ...)
+      return tblSeq({ func(...) })
+    end, args)
+  end
 end
 
 local wrap = funcify(function(ctx, func)
   return func
-end, 1)
+end, 1, true)
 
 local unwrap = funcify(function(ctx, func, ...)
-  return eval(ctx, func(...)) -- TODO: Is this right?
-end)
+  return eval(ctx, func, table.unpack(evalMany(ctx, { ... }))) -- TODO: Is this right?
+end, nil, true)
 
-local only = funcify(function(ctx, optValue)
-  return optValue, optValue and 1 or 0
-end, 0)
+local only = funcify(function(ctx, optValue, ...)
+  return evalIfApplied(ctx, eval(ctx, optValue), { ... })
+end, nil, true)
 
 local f = keyFunc(funcify(function(ctx, name, nameStr, ...)
   local args = { ... }
 
+  name = eval(ctx, name)
+  nameStr = eval(ctx, nameStr)
   local callFunc = #name == 1 and ctx.functions[name[1]] or ctx.using.functions[nameStr]
   if callFunc then
-    if #args == 0 then
-      return callFunc(EVAL_SYMBOL, ctx)
-    else
-      return callFunc(...)(EVAL_SYMBOL, ctx)
-    end
+    return eval(ctx, callFunc, table.unpack(args))
   end
 
   error("f: No function named " .. nameStr)
-end))
+end, nil, true))
 
 local function wrapUserFunction(scopeCtx, argList, func)
   return funcify(function(ctx2, ...)
     local innerArgs = { ... }
     local namedArgs = {}
     for i = 1, #argList do
-      namedArgs[argList[i]] = table.remove(innerArgs, 1)
+      -- TODO: Are the arguments safe to eval here?
+      namedArgs[argList[i]] = eval(ctx2, table.remove(innerArgs, 1))
     end
     -- TODO: What should be inherited from ctx, and what should be inherited from ctx2?
-    local newCtx = cloneTable(scopeCtx)
-    newCtx.args = cloneTable(scopeCtx.args)
+    local newCtx = cloneTable(scopeCtx or ctx2)
+    newCtx.args = cloneTable(newCtx.args)
     for k, v in pairs(namedArgs) do
       newCtx.args[k] = v
     end
-    return eval(newCtx, func, table.unpack(innerArgs))
-  end, #argList)
+    local innerFunc = removeEvalWrapper(func)
+    local result = eval(newCtx, innerFunc)
+    
+    return evalIfApplied(newCtx, result, innerArgs)
+  end, #argList, true)
 end
 
--- TODO: Nameless defn for some reason doesn't work as intended. Use "" as name instead.
 local defn = funcify(function(ctx, ...)
   local args  = { ... }
-  
   local index = 1
   local name, func, argList = "", nil, { [ARGS_SYMBOL] = true, args = {} }
-  if type(args[index] == "string") then
-    name = args[index]
-    index = index + 1
-  end
+  name = eval(ctx, args[index])
+  index = index + 1
+  
   if args[index + 1] then
     argList = eval(ctx, args[index])
     index = index + 1
@@ -488,24 +629,25 @@ local defn = funcify(function(ctx, ...)
   end
 
   return wrappedFunc, index
-end, 1, true)
+end, 2, true)
 
 local a = keyFunc(funcify(function(ctx, name)
   if #name ~= 1 then
     error("a: Invalid argument")
   end
   return { [ARG_SYMBOL] = true, name = name[1] }
-end))
+end, 1))
 
 local argsF = funcify(function(ctx, ...)
-  return { [ARGS_SYMBOL] = true, args = { ... } }
-end)
+  return { [ARGS_SYMBOL] = true, args = evalMany(ctx, { ... }) }
+end, nil, true)
 
 --
 
 local newtype = funcify(function(ctx, name, ...)
-  local args = { ... }
+  local args = evalMany(ctx, { ... })
   local eArgs = {}
+  local eName = eval(ctx, name)
   local firstArg = #args > 0 and args[1] or nil
   if firstArg and type(firstArg) == "table" and firstArg[ARGS_SYMBOL] then
     eArgs = args[1].args
@@ -518,17 +660,19 @@ local newtype = funcify(function(ctx, name, ...)
 
   local ntype = {
     [CUSTOM_TYPE_SYMBOL] = true,
-    name = (ctx.currentModule ~= "" and ctx.currentModule .. "." or "") .. name,
+    name = (ctx.currentModule ~= "" and ctx.currentModule .. "." or "") .. eName,
     args = eArgs,
     instances = {}
   }
-  ctx.types[name] = ntype
-end)
+  ctx.types[eName] = ntype
+end, nil, true)
 
 local eq2i
 eq2i = function(ctx, a, b, argBinder)
-  local aValue = eval(ctx, a)
-  local bValue = eval(ctx, b)
+  -- TODO: Is the eval wrapper important?
+  local aValue = removeEvalWrapper(eval(ctx, a))
+  local bValue = removeEvalWrapper(eval(ctx, b))
+  
 
   if aValue == ANY_SYMBOL or bValue == ANY_SYMBOL then
     return true
@@ -548,8 +692,8 @@ eq2i = function(ctx, a, b, argBinder)
     if aValue.type ~= bValue.type then
       return false
     end
-    for i = 1, #aValue.args do
-      if not eq2i(ctx, aValue.args[i], bValue.args[i], argBinder) then
+    for i = 1, aValue.argCount() do
+      if not eq2i(ctx, aValue.argAt(i), bValue.argAt(i), argBinder) then
         return false
       end
     end
@@ -573,9 +717,13 @@ local member = funcify(function(ctx, name, value)
   end
   local ntype = value.type
 
+  if ntype[NATIVE_TYPE_SYMBOL] then
+    error("member: Cannot access members of native types")
+  end
+
   for i = 1, #ntype.args do
     if ntype.args[i] == name then
-      return value.args[i]
+      return value.argAt(i)
     end
   end
 
@@ -593,13 +741,13 @@ local match = funcify(function(ctx, value, ...)
     local boundArgs = {}
     if nextArg == nil then
       return eval(ctx, compValue)
-    elseif eq2i(noArgCtx, wrap(firstArg), compValue, boundArgs) then
+    elseif eq2i(noArgCtx, wrap(firstArg), rescopeArg(noArgCtx, compValue), boundArgs) then
       local newCtx = cloneTable(ctx)
       newCtx.args = cloneTable(ctx.args)
       for k, v in pairs(boundArgs) do
         newCtx.args[k] = v
       end
-      return eval(newCtx, nextArg)
+      return eval(newCtx, removeEvalWrapper(nextArg))
     end
   end
 end, nil, true)
@@ -609,29 +757,42 @@ local any = funcify(function(ctx)
 end, 0)
 
 local typeConstructor = function(ctx, name, nameStr, ...)
+  name = eval(ctx, name)
+  nameStr = eval(ctx, nameStr)
   local ntype = (#name == 1 and ctx.types[name[1]]) or ctx.using.types[nameStr]
   if not ntype then
     error("t: No type named " .. nameStr)
   end
 
-  local args = { ... }
+  local args = evalMany(ctx, { ... })
   if #args ~= #ntype.args then
     error("t: Incorrect number of arguments")
   end
 
+  local cache = {}
   return {
     [INSTATIATED_TYPE_SYMBOL] = true,
     type = ntype,
-    args = args
+    argCount = function()
+      return #ntype.args
+    end,
+    argAt = function(i)
+      if cache[i] then
+        return cache[i]
+      end
+      cache[i] = eval(ctx, args[i])
+      return cache[i]
+    end
   }
 end
-local t = keyFunc(funcify(typeConstructor))
+local t = keyFunc(funcify(typeConstructor, nil, true))
 
 --
 
 local deftrait = funcify(function(ctx, traitName, ...)
-  local args = { ... }
-  local fullName = (ctx.currentModule ~= "" and ctx.currentModule .. "." or "") .. traitName
+  local eTraitName = eval(ctx, traitName)
+  local args = evalMany(ctx, { ... })
+  local fullName = (ctx.currentModule ~= "" and ctx.currentModule .. "." or "") .. eTraitName
   local trait = {
     name = fullName,
     methods = {},
@@ -648,8 +809,8 @@ local deftrait = funcify(function(ctx, traitName, ...)
     end
   end
 
-  ctx.traits[traitName] = trait
-end)
+  ctx.traits[eTraitName] = trait
+end, nil, true)
 
 local defmethod = funcify(function(ctx, name, ...)
   local args = { ... }
@@ -690,7 +851,9 @@ local defmethod = funcify(function(ctx, name, ...)
 end, nil, true)
 
 local instance = funcify(function(ctx, typeName, traitName, ...)
-  local args = {...}
+  typeName = eval(ctx, typeName)
+  traitName = eval(ctx, traitName)
+  local args = evalMany(ctx, { ... })
   local ntype = ctx.types[typeName] or ctx.using.types[typeName]
   local trait = ctx.traits[traitName] or ctx.using.traits[traitName]
   
@@ -729,7 +892,7 @@ local instance = funcify(function(ctx, typeName, traitName, ...)
   end
 
   ntype.instances[trait.name] = instance
-end)
+end, nil, true)
 
 local extends = funcify(function(ctx, name)
   local trait = ctx.traits[name] or ctx.using.traits[name]
@@ -742,31 +905,39 @@ local extends = funcify(function(ctx, name)
   }
 end, 1)
 
-local method = funcify(function(ctx, traitName, methodName, value)
-  if not (type(value) == "table" and value[INSTATIATED_TYPE_SYMBOL]) then
-    error("method: Not an instatiated type")
-  end
-
+local method = funcify(function(ctx, traitName, methodName)
   local ntrait = ctx.traits[traitName] or ctx.using.traits[traitName]
-  local trait = value.type.instances[(ntrait or {}).name]
-  if not trait then
-    if ntrait then
-      error("method: Instance does not implement trait " .. traitName)
-    else
-      error("method: No trait named " .. traitName)
-    end
+  if not ntrait then
+    error("method: No trait named " .. traitName)
   end
 
-  local method = trait.methods[methodName]
-  if not method then
+  local methodDef = ntrait.methods[methodName]
+  if not methodDef then
     error("method: No method named " .. methodName)
   end
 
-  return method.wrappedFunc(value)
-end, 3)
+  return funcify(function(ctx, value, ...)
+    value = eval(ctx, value)
+    if not (type(value) == "table" and value[INSTATIATED_TYPE_SYMBOL]) then
+      error("method: Not an instatiated type")
+    end
+  
+    local trait = value.type.instances[ntrait.name]
+    if not trait then
+      error("method: Instance does not implement trait " .. traitName)
+    end
+
+    local method = trait.methods[methodName]
+    if not method then
+      error("method: Instance does not implement method " .. methodName)
+    end
+
+    return method.wrappedFunc(value, ...)
+  end, #methodDef.argList, true)
+end, 2)
 
 local isInstance = funcify(function(ctx, typeName, traitName)
-  local ntype = ctx.types[typeName]
+  local ntype = (type(typeName) == "table" and typeName.type) or ctx.types[typeName]
   local trait = ctx.traits[traitName] or ctx.using.traits[traitName]
   if not ntype then
     error("isInstance: No type named " .. typeName)
@@ -828,15 +999,23 @@ local function loadmodi(ctx, name)
 end
 
 local loadmod = funcify(function(ctx, ...)
-  local args = { ... }
+  local args = evalMany(ctx, { ... })
   for k, v in ipairs(args) do
     loadmodi(ctx, v)
   end
-end)
+end, nil, true)
 
 local customMod = funcify(function(ctx, name, ...)
   local modName = eval(ctx, name)
-  local modCode = exec(...)
+  local args = { ... }
+  -- Strip context info
+  for i = 1, #args do
+    if (type(args[i]) == "table") and args[i][SCOPED_ARG_SYMBOL] then
+      args[i] = args[i].value
+    end
+  end
+
+  local modCode = exec(table.unpack(args))
   ctx.loadedModFiles[modName] = execMod(ctx, modName, modCode)
 
   importMod(ctx, ctx.loadedModFiles[modName])
@@ -849,34 +1028,34 @@ end, 1)
 
 local using = funcify(function(ctx, source, target)
   target = target or ""
-  for k, type in ipairs({ "functions", "types", "traits" }) do
-    ctx.using[type][target] = ctx.using[type][source]
+  for k, etype in ipairs({ "functions", "types", "traits" }) do
+    ctx.using[etype][target] = ctx.using[etype][source]
     local asPrefixSource = source .. "."
     local asPrefixTarget = target == "" and "" or target .. "."
     local newUsing = {} -- Table modifications during iteration cause random issues
-    for expName, value in pairs(ctx.using[type]) do
+    for expName, value in pairs(ctx.using[etype]) do
       if expName:sub(1, #asPrefixSource) == asPrefixSource then
         newUsing[asPrefixTarget .. expName:sub(#asPrefixSource + 1)] = value
       end
     end
     for expName, value in pairs(newUsing) do
-      ctx.using[type][expName] = value
+      ctx.using[etype][expName] = value
     end
   end
-end, 1)
+end, 1) -- TODO: Up to 2 args
 
 local export = funcify(function(ctx, type, ...)
-  local args = { ... }
+  local args = evalMany(ctx, { ... })
+  type = eval(ctx, type)
   ctx.moduleExports[ctx.currentModule] = ctx.moduleExports[ctx.currentModule] or {
     functions = {},
     types = {},
     traits = {},
   }
   for k, v in ipairs(args) do
-    local name = v
-    ctx.moduleExports[ctx.currentModule][type][name] = ctx[type][name]
+    ctx.moduleExports[ctx.currentModule][type][v] = ctx[type][v]
   end
-end)
+end, nil, true)
 
 local exportsf = export "functions"
 local exportst = export "types"
@@ -902,9 +1081,12 @@ format = function(ctx, value)
       end
     end
     return result .. ")"
+  elseif type(value) == "table" and value[INSTATIATED_TYPE_SYMBOL] and value.type[NATIVE_TYPE_SYMBOL] then
+    return "NativeType(" .. value.type.name .. ")"
   elseif type(value) == "table" and value[INSTATIATED_TYPE_SYMBOL] then
     local result = "(t." .. value.type.name
-    for k, v in ipairs(value.args) do
+    for i = 1, value.argCount() do
+      local v = value.argAt(i)
       result = result .. " " .. format(ctx, v)
     end
     return result .. ")"
@@ -917,41 +1099,21 @@ end
 
 --
 
-local add = funcify(function(ctx, ...)
-  local args = { ... }
-  local sum = 0
-  for k, v in ipairs(args) do
-    sum = sum + v
-  end
-  return sum
+local add = funcify(function(ctx, a, b)
+  return a + b
 end, 2)
 
-local sub = funcify(function(ctx, ...)
-  local args = { ... }
-  local diff = args[1]
-  for i = 2, #args do
-    diff = diff - args[i]
-  end
-  return diff
+local sub = funcify(function(ctx, a, b)
+  return a - b
 end, 2)
 
-local mul = funcify(function(ctx, ...)
-  local args = { ... }
-  local product = 1
-  for k, v in ipairs(args) do
-    product = product * v
-  end
-  return product
-end)
+local mul = funcify(function(ctx, a, b)
+  return a * b
+end, 2)
 
-local div = funcify(function(ctx, ...)
-  local args = { ... }
-  local quotient = args[1]
-  for i = 2, #args do
-    quotient = quotient / args[i]
-  end
-  return quotient
-end)
+local div = funcify(function(ctx, a, b)
+  return a / b
+end, 2)
 
 local mod = funcify(function(ctx, a, b)
   return a % b
@@ -963,17 +1125,9 @@ local neg = mul (-1)
 
 --
 
-local eq = funcify(function(ctx, ...)
-  local args = { ... }
-  local value = args[1]
-  for i = 2, #args do
-    local v = args[i]
-    if value ~= v then
-      return false
-    end
-  end
-  return true
-end)
+local eq = funcify(function(ctx, a, b)
+  return a == b
+end, 2)
 
 local lt = funcify(function(ctx, a, b)
   return a < b
@@ -981,7 +1135,7 @@ end, 2)
 
 local gt = funcify(function(ctx, a, b)
   return a > b
-end)
+end, 2)
 
 local lte = funcify(function(ctx, a, b)
   return a <= b
@@ -998,8 +1152,8 @@ end, 2)
 --
 
 local seq = funcify(function(ctx, ...)
-  return tblSeq({ ... })
-end)
+  return tblSeq({ ... }, ctx)
+end, nil, true)
 
 local toseq = funcify(function(ctx, value)
   return seqify(value)
@@ -1019,28 +1173,13 @@ end
 
 --
 
-local and_ = funcify(function(ctx, ...)
-  local args = { ... }
-  local lastVal
-  for k, v in ipairs(args) do
-    lastVal = v
-    if not lastVal then
-      return false
-    end
-  end
-  return lastVal
-end)
+local and_ = funcify(function(ctx, a, b)
+  return a and b
+end, 2)
 
-local or_ = funcify(function(ctx, ...)
-  local args = { ... }
-  for k, v in ipairs(args) do
-    local val = v
-    if val then
-      return val
-    end
-  end
-  return false
-end)
+local or_ = funcify(function(ctx, a, b)
+  return a or b
+end, 2)
 
 local not_ = funcify(function(ctx, a)
   return not a
@@ -1060,7 +1199,7 @@ local function evalOp(code, ...)
   argArray = argArray:sub(3)
   local func = load("return function(ctx, " .. argArray .. ") return " .. code .. " end")
   if not func then return end -- Hopefully, the program isn't using this
-  return func()
+  return funcify(func(), #{ ... })
 end
 
 local shl, shr, ashr, band, bor, bxor, bnot
@@ -1103,22 +1242,13 @@ local with = funcify(function(ctx, ...)
 
   local newCtx = cloneTable(ctx)
   newCtx.args = cloneTable(ctx.args)
-  for i = 1, #args, 2 do
-    newCtx.args[args[i]] = eval(newCtx, args[i + 1])
+  for i = 1, #args - 1, 2 do
+    newCtx.args[eval(newCtx, args[i])] = eval(newCtx, rescopeArg(newCtx, args[i + 1]))
   end
 
-  local func = args[#args]
+  local func = removeEvalWrapper(args[#args])
   return eval(newCtx, func)
 end, nil, true)
-
-local prints = funcify(function(ctx, ...)
-  local args = { ... }
-  local str = ""
-  for k, v in ipairs(args) do
-    str = str .. format(ctx, v) .. " "
-  end
-  print(str:sub(1, #str - 1))
-end)
 
 --
 
@@ -1200,6 +1330,9 @@ local foldr = funcify(function(ctx, func, acc, args)
 end, 3)
 
 local iterator = funcify(function(ctx, start, stepSize, numSteps)
+  start = eval(ctx, start)
+  stepSize = eval(ctx, stepSize)
+  numSteps = eval(ctx, numSteps)
   local index = start or 1
   local i = 0
   return iteratorSeq(function()
@@ -1211,12 +1344,12 @@ local iterator = funcify(function(ctx, start, stepSize, numSteps)
     index = index + (stepSize or 1)
     return value
   end), #{start, stepSize, numSteps}
-end)
+end, nil, true)
 
 local range = funcify(function(ctx, start, stop, stepSize)
-  local index = start
-  local stopIndex = stop
-  local size = stepSize or 1
+  local index = eval(ctx, start)
+  local stopIndex = eval(ctx, stop)
+  local size = eval(ctx, stepSize) or 1
   local i = 0
   return iteratorSeq(function()
     i = i + 1
@@ -1227,24 +1360,20 @@ local range = funcify(function(ctx, start, stop, stepSize)
     index = index + size
     return value
   end), #{start, stop, stepSize}
-end, 2)
+end, nil, true)
 
 local cycle = funcify(function(ctx, ...)
-  local args = {...}
-  local eArgs = {}
-  for k, v in ipairs(args) do
-    table.insert(eArgs, v)
-  end
+  local args = evalMany(ctx, { ... })
 
   local i = 0
   return iteratorSeq(function()
     i = i + 1
-    if i > #eArgs then
+    if i > #args then
       i = 1
     end
-    return eArgs[i]
+    return args[i]
   end)
-end)
+end, nil, true)
 
 local take = funcify(function(ctx, n, initialVal)
   local myArgs = seqify(initialVal)
@@ -1316,7 +1445,8 @@ local splice = funcify(function(ctx, start, num, initialVal)
 end, 3)
 
 local concat = funcify(function(ctx, ...)
-  local args = { ... }
+  local args = evalMany(ctx, { ... })
+
   local subseqs = {}
   for k, v in ipairs(args) do
     table.insert(subseqs, seqify(v))
@@ -1351,7 +1481,7 @@ local concat = funcify(function(ctx, ...)
   end
 
   return seqToOriginal(newSeq, args[1])
-end)
+end, nil, true)
 
 local count = funcify(function(ctx, seq)
   local mySeq = seqify(seq)
@@ -1365,8 +1495,8 @@ end, 1)
 
 --
 
-local upper = luaf (string.upper)
-local lower = luaf (string.lower)
+local upper = luaf (1) (string.upper)
+local lower = luaf (1) (string.lower)
 
 local str = funcify(function(ctx, ...)
   local args = { ... }
@@ -1413,11 +1543,11 @@ local withKeys = funcify(function(ctx, value, ...)
   local args = { ... }
   local mtbl = cloneTable(value, true)
   for i = 1, #args, 2 do
-    mtbl[args[i]] = args[i + 1]
+    mtbl[eval(ctx, args[i])] = args[i + 1]
   end
 
   return mtbl
-end)
+end, nil, true)
 
 local newTbl = withKeys {}
 
@@ -1461,46 +1591,68 @@ local bind = createBinder(BIND_SYMBOL)
 local bindval = createBinder(BIND_VALUE_SYMBOL)
 
 local block = funcify(function(ctx, ...)
-  local bindOp = eval(ctx, method, "builtin.monad", ">>=")
-  local nextOp = eval(ctx, method, "builtin.monad", ">>")
-
   local args = { ... }
   if #args == 0 then
     error("block: No arguments")
   end
 
-  local lastValue = args[#args]
-  if (type(lastValue) == "table") and (lastValue[BIND_SYMBOL] or lastValue[BIND_VALUE_SYMBOL]) then
-    for k, v in pairs(lastValue) do
-      print(k, v)
-    end
+  local strippedArgs = {}
+  for k, v in ipairs(args) do
+    table.insert(strippedArgs, removeEvalWrapper(v))
+  end
+
+  local lastValue = strippedArgs[#args]
+  if (lastValue == "table") and (lastValue[BIND_SYMBOL] or lastValue[BIND_VALUE_SYMBOL]) then
     error("block: Last value of block cannot be a bind")
   end
 
-  if #args == 1 then return lastValue end
+  if #args == 1 then
+    return eval(deriveScopeCtx(ctx), lastValue)
+  end
+  
+  local bindOp = eval(ctx, method, "builtin.monad", ">>=")
+  local nextOp = eval(ctx, method, "builtin.monad", ">>")
+
+  lastValue = strippedArgs[#strippedArgs]
   for i = #args - 1, 1, -1 do
-    local value = args[i]
-    if type(value) == "table" and value[BIND_SYMBOL] then
-      local scopeCtx = deriveScopeCtx(ctx)
-      local transformerFunction = wrapUserFunction(scopeCtx, { value.name }, lastValue)
-      lastValue = bindOp(value.value, transformerFunction)
-    elseif type(value) == "table" and value[BIND_VALUE_SYMBOL] then
-      local margs = { value.name, value.value, lastValue }
-      while args[i - 1] and type(args[i - 1]) == "table" and args[i - 1][BIND_VALUE_SYMBOL] do
-        table.insert(margs, 1, args[i - 1].name)
-        table.insert(margs, 2, args[i - 1].value)
+    local value = strippedArgs[i]
+    if (type(value) == "table") and value[BIND_SYMBOL] then
+      local vname = eval(ctx, value.name)
+      local transformerFunction = wrapUserFunction(nil, { vname }, lastValue)
+      lastValue = bindOp(removeEvalWrapper(value.value), transformerFunction)
+    elseif (type(value) == "table") and value[BIND_VALUE_SYMBOL] then
+      local vname = eval(ctx, value.name)
+      local margs = { vname, removeEvalWrapper(value.value), lastValue }
+
+      -- Small optimization to avoid nested with
+      local nextArg = strippedArgs[i - 1]
+      while nextArg and type(nextArg) == "table" and nextArg[BIND_VALUE_SYMBOL] do
+        table.insert(margs, 1, nextArg.name)
+        table.insert(margs, 2, nextArg.value)
         i = i - 1
+        nextArg = strippedArgs[i - 1]
       end
+
       lastValue = with(table.unpack(margs))
     else
       lastValue = nextOp(value, lastValue)
     end
   end
 
-  return lastValue
+  return eval(deriveScopeCtx(ctx), lastValue)
 end, nil, true)
 
-local getArgs = funcify(function(ctx)
+--
+
+local prints = ioFuncify(function(ctx, ...)
+  local str = ""
+  for k, v in ipairs({...}) do
+    str = str .. format(ctx, eval(ctx, v)) .. " "
+  end
+  print(str:sub(1, #str - 1))
+end)
+
+local getArgs = ioFuncify(function(ctx)
   return seqify(ctx.programArgs)
 end, 0)
 
@@ -1520,6 +1672,22 @@ local builtinLib = customMod "builtin"
   (newtype "failure" "reason")
   (defn ">>=" (method "monad" ">>="))
   (defn ">>" (method "monad" ">>"))
+  (instance "failure" "alternative"
+    (defmethod "|" (argsF "other") (a.other)))
+  (instance "failure" "monad"
+    (defmethod ">>=" (argsF "transform") (a.self))
+    (defmethod ">>" (argsF "next") (a.self)))
+  (instance "empty" "alternative"
+    (defmethod "|" (argsF "other") (a.other)))
+  (instance "empty" "monad"
+    (defmethod ">>=" (argsF "transform") (a.self))
+    (defmethod ">>" (argsF "next") (a.next)))
+  (instance "just" "alternative"
+    (defmethod "|" (argsF "other") (a.self)))
+  (instance "just" "monad"
+    (defmethod ">>=" (argsF "transform")
+      (match (a.self) (t.just (a.value)) (only (a.transform) (a.value))))
+    (defmethod ">>" (argsF "next") (only (a.next))))
   (exportst "just" "empty" "left" "right" "failure")
   (exportstr "alternative" "monad")
   (exportsf ">>=" ">>")
@@ -1615,7 +1783,7 @@ local environment = {
   bind = bind,
   bindval = bindval,
   block = block,
-  getArgs = getArgs,
+  getArgs = getArgs
 }
 
 local rtn = {}
@@ -1641,6 +1809,17 @@ local function printCallSite(collectedCallSites)
   end
 end
 
+local function execLine(ctx, line)
+  eval(ctx, line)
+  if ctx.functions["main"] then
+    local result = eval(ctx, ctx.functions["main"])
+    result = eval(ctx, result)
+    while (isIoEffect(result)) do
+      result = eval(ctx, result.effect())
+    end
+    return true
+  end
+end
 local function installAndRun(env, args, options)
   install(env)
   local ctx = createCtx(args, options)
@@ -1650,13 +1829,15 @@ local function installAndRun(env, args, options)
   func = function(line)
     if enableDebug then
       ctx.debugRef[1] = {}
-      local ok, err = pcall(eval, ctx, line)
+      local ok, err = pcall(execLine, ctx, line)
       if not ok then
         printCallSite(ctx.debugRef[1])
         error(err, -1)
       end
+      if err then return end
     else
-      eval(ctx, line)
+      local done = execLine(ctx, line)
+      if done then return end
     end
     return func
   end
