@@ -477,6 +477,7 @@ local void = setmetatable(VOID_SYMBOL, {
   end
 })
 
+local t
 local ioEffect
 local ioType = {
   [CUSTOM_TYPE_SYMBOL] = true,
@@ -500,7 +501,10 @@ local ioType = {
           argList = { "self", "transform" },
           wrappedFunc = funcify(function(ctx, self, transform)
             return ioEffect(function()
-              local result = eval(ctx, self).effect(ctx)
+              local ok, result = pcall(eval(ctx, self).effect, ctx)
+              if not ok then
+                return eval(ctx, t.builtin.failure(result))
+              end
               return eval(ctx, transform, result)
             end)
           end, 2, true)
@@ -786,7 +790,7 @@ local typeConstructor = function(ctx, name, nameStr, ...)
     end
   }
 end
-local t = keyFunc(funcify(typeConstructor, nil, true))
+t = keyFunc(funcify(typeConstructor, nil, true))
 
 --
 
@@ -1679,6 +1683,43 @@ local getLine = ioFuncify(function(ctx)
   return io.read()
 end, 0)
 
+local asIO = funcify(function(ctx, ...)
+  local args = { ... }
+  return ioEffect(function()
+    return eval(ctx, args[1], table.unpack(args, 2))
+  end)
+end, 1, true)
+
+local function isFailure(tbl)
+  return type(tbl) == "table"
+    and tbl[INSTANTIATED_TYPE_SYMBOL]
+    and tbl.type.name == "builtin.failure"
+end
+
+local try = funcify(function(ctx, innerMonad)
+  return ioEffect(function()
+    local ok, result = pcall(innerMonad.effect)
+    if not ok then
+      return eval(ctx, t.builtin.left(t.failure(result)))
+    end
+    if isFailure(result) then
+      return eval(ctx, t.builtin.left(result))
+    end
+    return eval(ctx, t.builtin.right(result))
+  end)
+end, 1)
+
+-- Like try, but preserves failure values
+local try2 = funcify(function(ctx, innerMonad)
+  return ioEffect(function()
+    local ok, result = pcall(innerMonad.effect)
+    if not ok then
+      return eval(ctx, t.builtin.left(t.failure(result)))
+    end
+    return eval(ctx, t.builtin.right(result))
+  end)
+end, 1)
+
 --
 
 local builtinLib = customMod "builtin"
@@ -1808,6 +1849,9 @@ local environment = {
   block = block,
   getArgs = getArgs,
   getLine = getLine,
+  asIO = asIO,
+  try = try,
+  try2 = try2,
 }
 
 local rtn = {}
@@ -1840,6 +1884,9 @@ local function execLine(ctx, line)
     result = eval(ctx, result)
     while (isIoEffect(result)) do
       result = eval(ctx, result.effect())
+    end
+    if isFailure(result) then
+      print("Program exited with failure: " .. result.argAt(1))
     end
     return true
   end
