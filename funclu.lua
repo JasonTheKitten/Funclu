@@ -4,16 +4,17 @@ local ARGS_SYMBOL = {}
 local ARG_SYMBOL = {}
 local BIND_SYMBOL = {}
 local BIND_VALUE_SYMBOL = {}
-local NATIVE_TYPE_SYMBOL = {}
 local CUSTOM_TYPE_SYMBOL = {}
 local EVAL_SYMBOL = {}
 local EXTENDS_SYMBOL = {}
-local INSTATIATED_TYPE_SYMBOL = {}
+local INSTANTIATED_TYPE_SYMBOL = {}
 local METHOD_DEFINITION_SYMBOL = {}
+local NATIVE_TYPE_SYMBOL = {}
 local SCOPED_ARG_SYMBOL = {}
 local SEQ_SYMBOL = {}
 local SEQ_DONE_SYMBOL = {}
 local UNRESOLVED_KEY_SYMBOL = {}
+local VOID_SYMBOL = {}
 
 local ISSUES_URL = "https://github.com/JasonTheKitten/Funclu/issues"
 
@@ -141,6 +142,7 @@ local function applyWithinScope(func, args)
   end
   return func
 end
+
 local function evalIfApplied(ctx, func, args)
   if #args == 0 then
     return func
@@ -459,6 +461,8 @@ end
 local function seqify(tbl)
   if type(tbl) == "string" then
     return strSeq(tbl)
+  elseif type(tbl) ~= "table" then
+    error("Cannot convert type " .. type(tbl) .. " to sequence")
   elseif not tbl[SEQ_SYMBOL] then
     return tblSeq(tbl)
   end
@@ -466,6 +470,12 @@ local function seqify(tbl)
 end
 
 --
+
+local void = setmetatable(VOID_SYMBOL, {
+  __call = function()
+    return VOID_SYMBOL
+  end
+})
 
 local ioEffect
 local ioType = {
@@ -494,15 +504,6 @@ local ioType = {
               return eval(ctx, transform, result)
             end)
           end, 2, true)
-        },
-        [">>"] = {
-          argList = { "self", "next" },
-          wrappedFunc = funcify(function(ctx, self, next)
-            return ioEffect(function()
-              eval(ctx, self).effect(ctx)
-              return eval(ctx, removeEvalWrapper(next))
-            end)
-          end, 2, true)
         }
       }
     }
@@ -512,7 +513,7 @@ local ioType = {
 ioEffect = function(effect)
   local errorStr = "Cannot access members of IO effect"
   return {
-    [INSTATIATED_TYPE_SYMBOL] = true,
+    [INSTANTIATED_TYPE_SYMBOL] = true,
     type = ioType,
     argCount = function() error(errorStr) end,
     argAt = function() error(errorStr) end,
@@ -524,7 +525,7 @@ local function ioFuncify(func, argData)
   return funcify(function(ctx, ...)
     local args = { ... }
     return ioEffect(function()
-      return func(ctx, table.unpack(evalMany(ctx, args)))
+      return func(ctx, table.unpack(evalMany(ctx, args))) or void
     end)
   end, argData, true)
 end
@@ -532,7 +533,7 @@ end
 local function isIoEffect(value)
   return
     type(value) == "table"
-    and value[INSTATIATED_TYPE_SYMBOL]
+    and value[INSTANTIATED_TYPE_SYMBOL]
     and (value.type == ioType)
 end
 
@@ -688,7 +689,7 @@ eq2i = function(ctx, a, b, argBinder)
   if type(aValue) ~= type(bValue) then
     return false
   end
-  if type(aValue) == "table" and aValue[INSTATIATED_TYPE_SYMBOL] then
+  if type(aValue) == "table" and aValue[INSTANTIATED_TYPE_SYMBOL] then
     if aValue.type ~= bValue.type then
       return false
     end
@@ -708,7 +709,7 @@ local eq2 = funcify(function(ctx, a, b)
 end, 2)
 
 local member = funcify(function(ctx, name, value)
-  if type(value) == "table" and not value[INSTATIATED_TYPE_SYMBOL] then
+  if type(value) == "table" and not value[INSTANTIATED_TYPE_SYMBOL] then
     return value[name]
   end
 
@@ -771,7 +772,7 @@ local typeConstructor = function(ctx, name, nameStr, ...)
 
   local cache = {}
   return {
-    [INSTATIATED_TYPE_SYMBOL] = true,
+    [INSTANTIATED_TYPE_SYMBOL] = true,
     type = ntype,
     argCount = function()
       return #ntype.args
@@ -918,7 +919,7 @@ local method = funcify(function(ctx, traitName, methodName)
 
   return funcify(function(ctx, value, ...)
     value = eval(ctx, value)
-    if not (type(value) == "table" and value[INSTATIATED_TYPE_SYMBOL]) then
+    if not (type(value) == "table" and value[INSTANTIATED_TYPE_SYMBOL]) then
       error("method: Not an instatiated type")
     end
   
@@ -927,8 +928,8 @@ local method = funcify(function(ctx, traitName, methodName)
       error("method: Instance does not implement trait " .. traitName)
     end
 
-    local method = trait.methods[methodName]
-    if not method then
+    local method = trait.methods[methodName] or methodDef
+    if not method or not method.wrappedFunc then
       error("method: Instance does not implement method " .. methodName)
     end
 
@@ -1081,9 +1082,9 @@ format = function(ctx, value)
       end
     end
     return result .. ")"
-  elseif type(value) == "table" and value[INSTATIATED_TYPE_SYMBOL] and value.type[NATIVE_TYPE_SYMBOL] then
+  elseif type(value) == "table" and value[INSTANTIATED_TYPE_SYMBOL] and value.type[NATIVE_TYPE_SYMBOL] then
     return "NativeType(" .. value.type.name .. ")"
-  elseif type(value) == "table" and value[INSTATIATED_TYPE_SYMBOL] then
+  elseif type(value) == "table" and value[INSTANTIATED_TYPE_SYMBOL] then
     local result = "(t." .. value.type.name
     for i = 1, value.argCount() do
       local v = value.argAt(i)
@@ -1253,6 +1254,7 @@ end, nil, true)
 --
 
 local map = funcify(function(ctx, func, initialVal)
+  initialVal = eval(ctx, initialVal)
   local cache = {}
   local myArgs = seqify(initialVal)
   local newSeq = {
@@ -1270,9 +1272,11 @@ local map = funcify(function(ctx, func, initialVal)
   }
 
   return seqToOriginal(newSeq, initialVal)
-end, 2)
+end, 2, true)
+-- TODO: Debug why initialVal is still a scopedArg if the ", true" is removed
 
 local filter = funcify(function(ctx, func, initialVal)
+  initialVal = eval(ctx, initialVal)
   local cache, index, innerIndex = {}, 1, 1
   local myArgs = seqify(initialVal)
 
@@ -1310,24 +1314,25 @@ local filter = funcify(function(ctx, func, initialVal)
   }
 
   return seqToOriginal(newSeq, initialVal)
-end, 2)
+end, 2, true)
 
 local foldl = funcify(function(ctx, func, acc, args)
-  local result = acc
+  local result = eval(ctx, acc)
+  args = eval(ctx, args)
   for k, v in ipairs(seqToTable(args)) do
     result = eval(ctx, func, result, v)
   end
   return result
-end, 3)
+end, 3, true)
 
 local foldr = funcify(function(ctx, func, acc, args)
-  local result = acc
-  local tbl = seqToTable(args)
+  local result = eval(ctx, acc)
+  local tbl = seqToTable(eval(ctx, args))
   for i = #tbl, 1, -1 do
     result = eval(ctx, func, tbl[i], result)
   end
   return result
-end, 3)
+end, 3, true)
 
 local iterator = funcify(function(ctx, start, stepSize, numSteps)
   start = eval(ctx, start)
@@ -1498,17 +1503,31 @@ end, 1)
 local upper = luaf (1) (string.upper)
 local lower = luaf (1) (string.lower)
 
-local str = funcify(function(ctx, ...)
-  local args = { ... }
+local strc = funcify(function(ctx, ...)
+  local args = evalMany(ctx, { ... })
   local str = ""
   for k, v in ipairs(args) do
-    if type(v) == "string" then
-      str = str .. v
-    elseif type(v) == "table" and v[SEQ_SYMBOL] then
-      str = str .. table.concat(seqToTable(v))
-    else
-      str = str .. format(ctx, v)
+    str = str .. format(ctx, v)
+  end
+
+  return str
+end, nil, true)
+
+local str = funcify(function(ctx, value)
+  return format(ctx, value)
+end, 1)
+
+local seqstr = funcify(function(ctx, value)
+  local str = ""
+  local mySeq = seqify(value)
+  local i = 0
+  while true do
+    local nextValue = mySeq.at(i + 1)
+    if nextValue == SEQ_DONE_SYMBOL then
+      break
     end
+    str = str .. format(ctx, nextValue)
+    i = i + 1
   end
 
   return str
@@ -1656,6 +1675,10 @@ local getArgs = ioFuncify(function(ctx)
   return seqify(ctx.programArgs)
 end, 0)
 
+local getLine = ioFuncify(function(ctx)
+  return io.read()
+end, 0)
+
 --
 
 local builtinLib = customMod "builtin"
@@ -1664,7 +1687,7 @@ local builtinLib = customMod "builtin"
   (deftrait "monad"
     (extends "alternative")
     (defmethod ">>=" (argsF "transform"))
-    (defmethod ">>" (argsF "next")))
+    (defmethod ">>" (argsF "next") (f">>=" (a.self) (defn "" (argsF "y") (a.next)))))
   (newtype "just" "a")
   (newtype "empty")
   (newtype "left" "a")
@@ -1675,19 +1698,16 @@ local builtinLib = customMod "builtin"
   (instance "failure" "alternative"
     (defmethod "|" (argsF "other") (a.other)))
   (instance "failure" "monad"
-    (defmethod ">>=" (argsF "transform") (a.self))
-    (defmethod ">>" (argsF "next") (a.self)))
+    (defmethod ">>=" (argsF "transform") (a.self)))
   (instance "empty" "alternative"
     (defmethod "|" (argsF "other") (a.other)))
   (instance "empty" "monad"
-    (defmethod ">>=" (argsF "transform") (a.self))
-    (defmethod ">>" (argsF "next") (a.next)))
+    (defmethod ">>=" (argsF "transform") (a.self)))
   (instance "just" "alternative"
     (defmethod "|" (argsF "other") (a.self)))
   (instance "just" "monad"
     (defmethod ">>=" (argsF "transform")
-      (match (a.self) (t.just (a.value)) (only (a.transform) (a.value))))
-    (defmethod ">>" (argsF "next") (only (a.next))))
+      (match (a.self) (t.just (a.value)) (only (a.transform) (a.value)))))
   (exportst "just" "empty" "left" "right" "failure")
   (exportstr "alternative" "monad")
   (exportsf ">>=" ">>")
@@ -1697,6 +1717,7 @@ local builtinLib = customMod "builtin"
 local environment = {
   exec = exec,
   run = run,
+  void = void,
   wrap = wrap,
   unwrap = unwrap,
   only = only,
@@ -1773,7 +1794,9 @@ local environment = {
   count = count,
   upper = upper,
   lower = lower,
+  strc = strc,
   str = str,
+  seqstr = seqstr,
   num = num,
   tbl = tbl,
   withKeys = withKeys,
@@ -1783,7 +1806,8 @@ local environment = {
   bind = bind,
   bindval = bindval,
   block = block,
-  getArgs = getArgs
+  getArgs = getArgs,
+  getLine = getLine,
 }
 
 local rtn = {}
