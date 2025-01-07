@@ -95,6 +95,9 @@ eval = function(ctx, func, ...)
     ctx = res.ctx
     res = res.value
   end
+  if type(res) == "table" and res[UNRESOLVED_KEY_SYMBOL] then
+    res = res()
+  end
   if type(res) == "function" then
     local args = { ... }
     if #args > 0 then
@@ -281,6 +284,7 @@ funcify = function(func, argsData, disableAutoEval, extraCallSites)
   
   return f({}, cloneTable(extraCallSites or {}))
 end
+
 --
 
 local function createBaseDriver()
@@ -347,6 +351,7 @@ local function createBaseCtx(args, options)
   return {
     options = myOptions,
     loadedModFiles = {},
+    providerNames = {},
     autoloadMods = {},
     programArgs = args,
     debugRef = {{}},
@@ -367,6 +372,7 @@ local function createCtxUsingBase(baseCtx)
       types = {},
       traits = {},
     },
+    currentBaseModule = "",
     currentModule = "",
     disableArgumentResolution = false
   }
@@ -384,23 +390,18 @@ local function createCtx(args, options)
   return createCtxUsingBase(baseCtx)
 end
 
+-- TODO: Fine tune what is derived
 local function deriveScopeCtx(ctx)
   local newCtx = {
-    baseCtx = ctx.baseCtx,
-    functions = cloneTable(ctx.functions),
-    args = cloneTable(ctx.args),
-    types = cloneTable(ctx.types),
-    traits = cloneTable(ctx.traits),
-    moduleExports = cloneTable(ctx.moduleExports),
-    using = {
-      functions = cloneTable(ctx.using.functions),
-      types = cloneTable(ctx.using.types),
-      traits = cloneTable(ctx.using.traits),
-    },
-    currentModule = ctx.currentModule,
-    disableArgumentResolution = ctx.disableArgumentResolution
+      baseCtx = ctx.baseCtx,
+      types = ctx.types,
+      traits = ctx.traits
   }
   for k, v in pairs(ctx) do
+    newCtx[k] = newCtx[k] or ((type(v) == "table") and cloneTable(v)) or v
+  end
+  newCtx.using.functions = cloneTable(ctx.using.functions)
+  for k, v in pairs(ctx.baseCtx) do
     newCtx[k] = v
   end
 
@@ -658,7 +659,6 @@ local function wrapUserFunction(scopeCtx, argList, func)
     local innerArgs = { ... }
     local namedArgs = {}
     for i = 1, #argList do
-      -- TODO: Are the arguments safe to eval here?
       namedArgs[argList[i]] = evalLater(ctx2, table.remove(innerArgs, 1))
     end
     -- TODO: What should be inherited from ctx, and what should be inherited from ctx2?
@@ -1033,6 +1033,7 @@ end, 2)
 
 local function execMod(ctx, modName, mod)
   local newCtx = createCtxUsingBase(ctx.baseCtx)
+  newCtx.currentBaseModule = modName
   newCtx.currentModule = modName
   ctx.loadedModFiles[modName] = "loading"
   local oldCallSites = newCtx.debugRef[1]
@@ -1053,7 +1054,7 @@ importMod = function(ctx, allExports)
   end
 end
 
-local function loadmodi(ctx, name)
+local function loadmodi(ctx, name, nameOverride)
   local modName = eval(ctx, name)
   local driver = ctx.options.driver
   local reducedModName = driver.reduceModName(modName)
@@ -1070,12 +1071,38 @@ local function loadmodi(ctx, name)
   end
   
   importMod(ctx, ctx.loadedModFiles[reducedModName])
+
+  return reducedModName
 end
 
 local loadmod = funcify(function(ctx, ...)
   local args = evalMany(ctx, { ... })
   for k, v in ipairs(args) do
     loadmodi(ctx, v)
+  end
+end, nil, true)
+
+local loadprovider = funcify(function(ctx, providerName, defaultModule)
+  providerName = eval(ctx, providerName)
+  defaultModule = eval(ctx, defaultModule)
+  if not ctx.providerNames[providerName] then
+    if not defaultModule then
+      error("loadprovider: Provider not in cache and no default module provided")
+    end
+    ctx.providerNames[providerName] = loadmodi(ctx, defaultModule)
+  end
+
+  importMod(ctx, ctx.loadedModFiles[ctx.providerNames[providerName]])
+  defaultModule = defaultModule or ctx.providerNames[providerName]
+  for k, v in pairs(ctx.using) do
+    for k2, v2 in pairs(v) do
+      if k2:sub(1, #defaultModule + 1) == (defaultModule .. ".") then
+        local suffix = k2:sub(#defaultModule + 2)
+        local newName = providerName .. "." .. suffix
+        v[newName] = v2
+      end
+    end
+    v[providerName] = v[ctx.providerNames[providerName]]
   end
 end, nil, true)
 
@@ -1096,16 +1123,37 @@ local customMod = funcify(function(ctx, name, ...)
 end, nil, true)
 
 local modulename = funcify(function(ctx, name)
-  ctx.currentModule = name or ctx.currentModule
+  ctx.currentBaseModule = name
+  ctx.currentModule = name
   return ctx.currentModule
 end, 1)
 
+local submodule = funcify(function(ctx, name)
+  ctx.currentModule =
+    (name == "" and ctx.currentBaseModule)
+    or (ctx.currentBaseModule .. "." .. name)
+  return ctx.currentModule
+end, 1)
+
+local function findFuncTarget(name)
+  for i = #name, 1, -1 do
+    if name:sub(i, i) == "." then
+      local lname = name:sub(i + 1)
+      return lname ~= "" and lname or nil
+    end
+  end
+end
+
 local using = funcify(function(ctx, source, target)
-  target = target or ""
+  source = eval(ctx, source)
+  target = eval(ctx, target)
   for k, etype in ipairs({ "functions", "types", "traits" }) do
-    ctx.using[etype][target] = ctx.using[etype][source]
+    local funcTarget = target or findFuncTarget(source)
+    if funcTarget and (funcTarget ~= "") then
+      ctx.using[etype][funcTarget] = ctx.using[etype][source]
+    end
     local asPrefixSource = source .. "."
-    local asPrefixTarget = target == "" and "" or target .. "."
+    local asPrefixTarget = ((target == "") or not target) and "" or target .. "."
     local newUsing = {} -- Table modifications during iteration cause random issues
     for expName, value in pairs(ctx.using[etype]) do
       if expName:sub(1, #asPrefixSource) == asPrefixSource then
@@ -1116,7 +1164,7 @@ local using = funcify(function(ctx, source, target)
       ctx.using[etype][expName] = value
     end
   end
-end, 1) -- TODO: Up to 2 args
+end, nil, true)
 
 local export = funcify(function(ctx, type, ...)
   local args = evalMany(ctx, { ... })
@@ -1794,6 +1842,8 @@ end, 1)
 --
 
 local builtinLib = customMod "builtin"
+  (defn ">>=" (method "monad" ">>="))
+  (defn ">>" (method "monad" ">>"))
   (deftrait "alternative"
     (defmethod "|" (argsF "other")))
   (deftrait "monad"
@@ -1805,8 +1855,6 @@ local builtinLib = customMod "builtin"
   (newtype "left" "a")
   (newtype "right" "b")
   (newtype "failure" "reason")
-  (defn ">>=" (method "monad" ">>="))
-  (defn ">>" (method "monad" ">>"))
   (instance "failure" "alternative"
     (defmethod "|" (argsF "other") (a.other)))
   (instance "failure" "monad"
@@ -1853,7 +1901,9 @@ local environment = {
   method = method,
   isInstance = isInstance,
   loadmod = loadmod,
+  loadprovider = loadprovider,
   modulename = modulename,
+  submodule = submodule,
   using = using,
   exportsf = exportsf,
   exportst = exportst,
