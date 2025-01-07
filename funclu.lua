@@ -197,6 +197,7 @@ local function evalFunction(ctx, func, eArgs, disableAutoEval, argsData)
         error("Variadic args with auto eval not supported")
       end
     end
+    ctx.options.driver.preventTimeout()
     local result, actual = func(ctx, table.unpack(eArgs))
     actual = actual or (type(argsData) == "number" and argsData) or #eArgs
     if type(removeEvalWrapper(result)) == "function" then
@@ -271,12 +272,61 @@ funcify = function(func, argsData, disableAutoEval, extraCallSites)
 end
 --
 
-local function createDefaultDriver()
+local function createBaseDriver()
   local driver = {}
   driver.reduceModName = function(name) return name end
   driver.loadmod = require
+  driver.preventTimeout = function() end
 
   return driver
+end
+
+-- Drivers allow for ComputerCraft/OpenComputers integration
+local function createCraftOSDriver()
+  local driver = createBaseDriver()
+
+  local oldTime = os.clock()
+  driver.preventTimeout = function()
+    local newTime = os.clock()
+    if newTime > (oldTime + 2.5) then
+      ---@diagnostic disable-next-line: undefined-field
+      os.queueEvent("")
+      coroutine.yield("")
+      oldTime = newTime
+    end
+  end
+
+  return driver
+end
+
+local function createOpenOSDriver()
+  local driver = createBaseDriver()
+
+  local oldTime = os.clock() * 100
+  driver.preventTimeout = function()
+    local newTime = os.clock() * 100
+    if newTime > (oldTime + 2.5) then
+      ---@diagnostic disable-next-line: undefined-global
+      computer.pushSignal("")
+      coroutine.yield("")
+      oldTime = newTime
+    end
+  end
+
+  return driver
+end
+
+local function createPucDriver()
+  return createBaseDriver()
+end
+
+local function createDefaultDriver()
+  return
+    ---@diagnostic disable-next-line: undefined-field
+    (os.queueEvent and createCraftOSDriver())
+    ---@diagnostic disable-next-line: undefined-global
+    or (computer.pushSignal and createOpenOSDriver())
+    or createPucDriver()
 end
 
 local function createBaseCtx(args, options)
