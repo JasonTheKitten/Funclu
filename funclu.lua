@@ -545,10 +545,10 @@ local function createErr(ctx, err)
   for k, v in pairs(ctx.debugRef[1]) do
     table.insert(asOrderedTbl, k)
   end
-  return t.err(err, tblSeq(asOrderedTbl))
+  return eval(ctx, t.builtin.err(err, tblSeq(asOrderedTbl)))
 end
 
-local ioEffect
+local ioEffect, isIoEffect
 local ioType = {
   [CUSTOM_TYPE_SYMBOL] = true,
   [NATIVE_TYPE_SYMBOL] = true,
@@ -571,9 +571,19 @@ local ioType = {
           argList = { "self", "transform" },
           wrappedFunc = funcify(function(ctx, self, transform)
             return ioEffect(function()
-              local ok, result = pcall(eval(ctx, self).effect, ctx)
-              if not ok then
-                return eval(ctx, createErr(ctx, result))
+              local ok, result = pcall(eval(ctx, self).effect)
+              -- TODO: Is the loop supposed to be needed, or a sign of a deeper issue?
+              while true do
+                if not ok then
+                  return eval(ctx, createErr(ctx, result))
+                end
+                ok, result = pcall(eval, ctx, result)
+                if ok and not isIoEffect(result) then
+                  break
+                end
+                if isIoEffect(result) then
+                  ok, result = pcall(result.effect)
+                end
               end
               return eval(ctx, transform, result)
             end)
@@ -604,7 +614,7 @@ local function ioFuncify(func, argData)
   end, argData, true)
 end
 
-local function isIoEffect(value)
+isIoEffect = function(value)
   return
     type(value) == "table"
     and value[INSTANTIATED_TYPE_SYMBOL]
@@ -612,6 +622,13 @@ local function isIoEffect(value)
 end
 
 --
+
+local nilToVoid = funcify(function(ctx, value)
+  if value == nil then
+    return void
+  end
+  return value
+end, nil, true)
 
 local function luaf(args)
   return function(func)
@@ -621,13 +638,99 @@ local function luaf(args)
   end
 end
 
-local function luaftbl(args)
-  return function(func)
-    return funcify(function(ctx, ...)
-      return tblSeq({ func(...) })
-    end, args)
+local luaf2
+local function marshallFromLua(options, value)
+  if type(value) == "table" then
+    local newTbl = {}
+    for k, v in pairs(value) do
+      newTbl[k] = marshallFromLua(v)
+    end
+    return newTbl
+  elseif type(value) == "function" then
+    return luaf2(options)(-1)(value)
   end
+  return value
 end
+local function marshallToLua(ctx, options, value)
+  if type(value) == "table" and value[INSTANTIATED_TYPE_SYMBOL] then
+    local ntype = value.type
+    local newTbl = {}
+    for i = 1, ntype.argCount() do
+      newTbl[i] = marshallToLua(ctx, options, value.argAt(i))
+    end
+    return newTbl
+  elseif type(value) == "table" and value[SEQ_SYMBOL] then
+    local seqAsTable = seqToTable(value, nil)
+    local newTbl = {}
+    for i = 1, #seqAsTable do
+      newTbl[i] = marshallToLua(ctx, options, seqAsTable[i])
+    end
+    return newTbl
+  elseif value == void then
+    return nil
+  elseif type(value) == "table" then
+    local newTbl = {}
+    for k, v in pairs(value) do
+      newTbl[k] = marshallToLua(ctx, options, v)
+    end
+    return newTbl
+  elseif isIoEffect(value) then
+    return function()
+      return marshallToLua(ctx, options, eval(ctx, value))
+    end
+  elseif type(value) == "function" then
+    return function(...)
+      local result = eval(ctx, value, ...)
+      if type(result) == "function" then
+        return result
+      end
+      return marshallToLua(ctx, options, result)
+    end
+  end
+  return value
+end
+
+luaf2 = funcify(function(ctx, options, args, func)
+  options = eval(ctx, options)
+  args = eval(ctx, args)
+  func = removeEvalWrapper(func)
+  return funcify(function(ctx, ...)
+    local args = { ... }
+    local finalArgs = {}
+    if options.marshallToLua then
+      for k, v in ipairs(args) do
+        table.insert(finalArgs, marshallToLua(ctx, options, v))
+      end
+    else
+      finalArgs = args
+    end
+
+    local result = { func(table.unpack(finalArgs)) }
+
+    local finalResult = {}
+    if options.marshallFromLua then
+      for k, v in ipairs(result) do
+        table.insert(finalResult, marshallFromLua(options, v))
+      end
+    else
+      finalResult = result
+    end
+
+    if options.returnSeq then
+      finalResult = tblSeq(finalResult)
+    else
+      finalResult = finalResult[1]
+    end
+
+    if options.hasSideEffects then
+      return ioEffect(function()
+        return finalResult or void
+      end)
+    end
+
+    return finalResult
+  end, args)
+end, 3, true)
 
 local wrap = funcify(function(ctx, func)
   return func
@@ -1927,8 +2030,9 @@ local environment = {
   exportsf = exportsf,
   exportst = exportst,
   exportstr = exportstr,
+  nilToVoid = nilToVoid,
   luaf = luaf,
-  luaftbl = luaftbl,
+  luaf2 = luaf2,
   add = add,
   sub = sub,
   mul = mul,
