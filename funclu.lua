@@ -88,7 +88,8 @@ local function removeEvalWrapper(res)
   return res
 end
 
-local function eval(ctx, func, ...)
+local eval
+eval = function(ctx, func, ...)
   local res = func
   while (type(res) == "table") and res[SCOPED_ARG_SYMBOL] do
     ctx = res.ctx
@@ -102,7 +103,7 @@ local function eval(ctx, func, ...)
     res = res(EVAL_SYMBOL, ctx)
   end
   if (type(res) == "table") and res[ARG_SYMBOL] and not ctx.disableArgumentResolution then
-    return ctx.args[res.name]
+    return eval(ctx, ctx.args[res.name])
   end
   return res
 end
@@ -113,6 +114,17 @@ local function evalMany(ctx, args, num)
     eArgs[i] = eval(ctx, args[i])
   end
   return eArgs
+end
+
+local funcify
+local function evalLater(ctx, innerVal)
+  local cache
+  return funcify(function()
+    if not cache then
+      cache = eval(ctx, innerVal)
+    end
+    return cache
+  end, 0)
 end
 
 local function scopeArg(ctx, arg)
@@ -174,7 +186,6 @@ local function applyArgs(ctx, args)
   return appliedArgs
 end
 
-local funcify
 local function evalFunction(ctx, func, eArgs, disableAutoEval, argsData)
   local completed =
     (type(argsData) == "number" and #eArgs >= argsData)
@@ -325,7 +336,7 @@ local function createDefaultDriver()
     ---@diagnostic disable-next-line: undefined-field
     (os.queueEvent and createCraftOSDriver())
     ---@diagnostic disable-next-line: undefined-global
-    or (computer.pushSignal and createOpenOSDriver())
+    or (computer and computer.pushSignal and createOpenOSDriver())
     or createPucDriver()
 end
 
@@ -621,6 +632,14 @@ local only = funcify(function(ctx, optValue, ...)
   return evalIfApplied(ctx, eval(ctx, optValue), { ... })
 end, nil, true)
 
+local undefined = funcify(function(ctx)
+  error("undefined: Attempt to evaluate undefined")
+end, 0)
+
+local errs = funcify(function(ctx, arg)
+  error("errs: " .. tostring(eval(ctx, arg)), -1)
+end, 1)
+
 local f = keyFunc(funcify(function(ctx, name, nameStr, ...)
   local args = { ... }
 
@@ -640,7 +659,7 @@ local function wrapUserFunction(scopeCtx, argList, func)
     local namedArgs = {}
     for i = 1, #argList do
       -- TODO: Are the arguments safe to eval here?
-      namedArgs[argList[i]] = eval(ctx2, table.remove(innerArgs, 1))
+      namedArgs[argList[i]] = evalLater(ctx2, table.remove(innerArgs, 1))
     end
     -- TODO: What should be inherited from ctx, and what should be inherited from ctx2?
     local newCtx = cloneTable(scopeCtx or ctx2)
@@ -800,7 +819,7 @@ local match = funcify(function(ctx, value, ...)
       local newCtx = cloneTable(ctx)
       newCtx.args = cloneTable(ctx.args)
       for k, v in pairs(boundArgs) do
-        newCtx.args[k] = v
+        newCtx.args[k] = evalLater(ctx, v)
       end
       return eval(newCtx, removeEvalWrapper(nextArg))
     end
@@ -1298,7 +1317,9 @@ local with = funcify(function(ctx, ...)
   local newCtx = cloneTable(ctx)
   newCtx.args = cloneTable(ctx.args)
   for i = 1, #args - 1, 2 do
-    newCtx.args[eval(newCtx, args[i])] = eval(newCtx, rescopeArg(newCtx, args[i + 1]))
+    newCtx.args[eval(newCtx, args[i])] = evalLater(newCtx, rescopeArg(newCtx, args[i + 1]))
+    newCtx = cloneTable(newCtx)
+    newCtx.args = cloneTable(newCtx.args)
   end
 
   local func = removeEvalWrapper(args[#args])
@@ -1812,6 +1833,8 @@ local environment = {
   wrap = wrap,
   unwrap = unwrap,
   only = only,
+  undefined = undefined,
+  errs = errs,
   f = f,
   defn = defn,
   a = a,
