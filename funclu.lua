@@ -1206,12 +1206,16 @@ local loadprovider = funcify(function(ctx, providerName, defaultModule)
   importMod(ctx, ctx.loadedModFiles[ctx.providerNames[providerName]])
   defaultModule = defaultModule or ctx.providerNames[providerName]
   for k, v in pairs(ctx.using) do
+    local newValues = {}
     for k2, v2 in pairs(v) do
       if k2:sub(1, #defaultModule + 1) == (defaultModule .. ".") then
         local suffix = k2:sub(#defaultModule + 2)
         local newName = providerName .. "." .. suffix
-        v[newName] = v2
+        newValues[newName] = v2
       end
+    end
+    for k2, v2 in pairs(newValues) do
+      v[k2] = v2
     end
     v[providerName] = v[ctx.providerNames[providerName]]
   end
@@ -1406,20 +1410,27 @@ end
 
 --
 
+local function voidToNil(value)
+  if value == void then
+    return nil
+  end
+  return value
+end
+
 local and_ = funcify(function(ctx, a, b)
-  return a and b
+  return voidToNil(a) and voidToNil(b)
 end, 2)
 
 local or_ = funcify(function(ctx, a, b)
-  return a or b
+  return voidToNil(a) or voidToNil(b)
 end, 2)
 
 local not_ = funcify(function(ctx, a)
-  return not a
+  return not voidToNil(a)
 end, 1)
 
 local xor = funcify(function(ctx, a, b)
-  return a ~= b
+  return voidToNil(a) ~= voidToNil(b)
 end, 2)
 
 --
@@ -1654,6 +1665,10 @@ local tail = funcify(function(ctx, initialVal)
   }
   return seqToOriginal(newSeq, initialVal)
 end, 1)
+
+local nth = funcify(function(ctx, n, initialVal)
+  return seqify(initialVal).at(n)
+end, 2)
 
 local subseq = funcify(function(ctx, start, num, initialVal)
   local mySeq = seqify(initialVal)
@@ -2075,6 +2090,7 @@ local environment = {
   skip = skip,
   head = head,
   tail = tail,
+  nth = nth,
   subseq = subseq,
   splice = splice,
   concat = concat,
