@@ -540,6 +540,14 @@ local void = setmetatable(VOID_SYMBOL, {
 })
 
 local t
+local function createErr(ctx, err)
+  local asOrderedTbl = {}
+  for k, v in pairs(ctx.debugRef[1]) do
+    table.insert(asOrderedTbl, k)
+  end
+  return t.err(err, tblSeq(asOrderedTbl))
+end
+
 local ioEffect
 local ioType = {
   [CUSTOM_TYPE_SYMBOL] = true,
@@ -565,7 +573,7 @@ local ioType = {
             return ioEffect(function()
               local ok, result = pcall(eval(ctx, self).effect, ctx)
               if not ok then
-                return eval(ctx, t.builtin.failure(result))
+                return eval(ctx, createErr(ctx, result))
               end
               return eval(ctx, transform, result)
             end)
@@ -1815,13 +1823,19 @@ local function isFailure(tbl)
     and tbl.type.name == "builtin.failure"
 end
 
+local function isErr(tbl)
+  return type(tbl) == "table"
+    and tbl[INSTANTIATED_TYPE_SYMBOL]
+    and tbl.type.name == "builtin.err"
+end
+
 local try = funcify(function(ctx, innerMonad)
   return ioEffect(function()
     local ok, result = pcall(innerMonad.effect)
     if not ok then
-      return eval(ctx, t.builtin.left(t.failure(result)))
+      return eval(ctx, t.builtin.left(createErr(ctx, result)))
     end
-    if isFailure(result) then
+    if isFailure(result) or isErr(result) then
       return eval(ctx, t.builtin.left(result))
     end
     return eval(ctx, t.builtin.right(result))
@@ -1833,7 +1847,7 @@ local try2 = funcify(function(ctx, innerMonad)
   return ioEffect(function()
     local ok, result = pcall(innerMonad.effect)
     if not ok then
-      return eval(ctx, t.builtin.left(t.failure(result)))
+      return eval(ctx, t.builtin.left(createErr(ctx, result)))
     end
     return eval(ctx, t.builtin.right(result))
   end)
@@ -1855,10 +1869,15 @@ local builtinLib = customMod "builtin"
   (newtype "left" "a")
   (newtype "right" "b")
   (newtype "failure" "reason")
+  (newtype "err" "reason" "callsites")
   (instance "failure" "alternative"
     (defmethod "|" (argsF "other") (a.other)))
   (instance "failure" "monad"
-    (defmethod ">>=" (argsF "transform") (a.self)))
+    (defmethod ">>=" (a.self)))
+  (instance "err" "alternative"
+    (defmethod "|" (argsF "other") (a.other)))
+  (instance "err" "monad"
+    (defmethod ">>=" (a.self)))
   (instance "empty" "alternative"
     (defmethod "|" (argsF "other") (a.other)))
   (instance "empty" "monad"
@@ -1868,7 +1887,7 @@ local builtinLib = customMod "builtin"
   (instance "just" "monad"
     (defmethod ">>=" (argsF "transform")
       (match (a.self) (t.just (a.value)) (only (a.transform) (a.value)))))
-  (exportst "just" "empty" "left" "right" "failure")
+  (exportst "just" "empty" "left" "right" "failure" "err")
   (exportstr "alternative" "monad")
   (exportsf ">>=" ">>")
 
@@ -1986,6 +2005,7 @@ end
 install(rtn)
 
 local function printCallSite(collectedCallSites)
+  collectedCallSites = seqToTable(collectedCallSites)
   print("---\nThe Funclu library reported an error. If you believe this is a Funclu bug, " ..
     "please report it at " .. ISSUES_URL .. "\n---")
 
@@ -1995,7 +2015,7 @@ local function printCallSite(collectedCallSites)
     return
   end
   print("Potentially Relevant Call Sites:")
-  for callSite in pairs(collectedCallSites) do
+  for _, callSite in ipairs(collectedCallSites) do
     print(callSite)
   end
 end
@@ -2011,6 +2031,12 @@ local function execLine(ctx, line)
     if isFailure(result) then
       print("Program exited with failure: " .. result.argAt(1))
     end
+    if isErr(result) then
+      if not enableDebug then
+        error(result.argAt(1), -1)
+      end
+      error(result)
+    end
     return true
   end
 end
@@ -2025,8 +2051,9 @@ local function installAndRun(env, args, options)
       ctx.debugRef[1] = {}
       local ok, err = pcall(execLine, ctx, line)
       if not ok then
-        printCallSite(ctx.debugRef[1])
-        error(err, -1)
+        local errT = (isErr(err) and err) or eval(ctx, createErr(ctx, err))
+        printCallSite(errT.argAt(2))
+        error(errT.argAt(1), -1)
       end
       if err then return end
     else
