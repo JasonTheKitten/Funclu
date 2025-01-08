@@ -20,9 +20,11 @@ require("funclu").enableDebug().install(_ENV, { ... })
 
 Because Funclu is designed to be able to work in a standard Lua environment, you can run this code on ComputerCraft, OpenComputers, and even PUC Lua.
 
-!(CC Hello, World)[images/cc_hello.png]
-!(OC Hello, World)[images/oc_hello.png]
-!(PUC Hello, World)[images/puc_hello.png]
+![CC Hello, World](images/cc_hello.png)
+
+![OC Hello, World](images/oc_hello.png)
+
+![PUC Hello, World](images/puc_hello.png)
 
 You can, of course, write more complex and interactive programs with Funclu:
 
@@ -39,7 +41,7 @@ require("funclu").enableDebug().install(_ENV, { ... })
 ))
 ```
 
-!(Interactive Hello)[images/interactive_hello.png]
+![Interactive Hello](images/interactive_hello.png)
 
 Funclu includes a Sequence API, which allows you to work with lists of numbers:
 
@@ -64,7 +66,7 @@ require("funclu").enableDebug().install(_ENV, { ... })
 ))
 ```
 
-!(Numerical Sequence Example)[images/fib_example.png]
+![Numerical Sequence Example](images/fib_example.png)
 
 Notice that, even though the "Computing values" line comes after fibSeq is bound, it still runs before the computation.
 This is because Funclu supports lazy evaluation.
@@ -90,7 +92,7 @@ require("funclu").enableDebug().install(_ENV, { ... })
 In the above example, the result of division will be shown if the division is successful.
 But if the user attempts to enter a non-numerical value, the error will be caught and displayed to the user.
 
-!(Error Handling Example)[images/error_example.png]
+![Error Handling Example](images/error_example.png)
 
 Although Funclu is designed to be portable across Lua environments, it also has constructs that
 allow for doing things specific to a given environment. Furthermore, it also has constructs that
@@ -101,9 +103,9 @@ The code for this example is quite long, so you can find it in the `examples/oc_
 
 The provided example shows using environment-specific functions to set the color of text in CC and OC.
 
-!(CC Environment-Specific Example)[images/cc_envspec.png]
+![CC Environment-Specific Example](images/cc_envspec.png)
 
-!(OC Environment-Specific Example)[images/oc_envspec.png]
+![OC Environment-Specific Example](images/oc_envspec.png)
 
 However, the constructs provided for doing this are extremely clunky and bug-prone at this time,
 and so will likely be refined in future updates.
