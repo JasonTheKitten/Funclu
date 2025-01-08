@@ -1639,18 +1639,6 @@ local take = funcify(function(ctx, n, initialVal)
   return seqToOriginal(newSeq, initialVal)
 end, 2)
 
-local skip = funcify(function(ctx, n, initialVal)
-  local mySeq = seqify(initialVal)
-  local newSeq = {
-    [SEQ_SYMBOL] = true,
-    at = function(i)
-      return mySeq.at(i + n)
-    end
-  }
-
-  return seqToOriginal(newSeq, initialVal)
-end, 2)
-
 local head = funcify(function(ctx, args)
   return seqify(args).at(1)
 end, 1)
@@ -2087,7 +2075,6 @@ local environment = {
   range = range,
   cycle = cycle,
   take = take,
-  skip = skip,
   head = head,
   tail = tail,
   nth = nth,
